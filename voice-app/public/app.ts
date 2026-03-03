@@ -7,6 +7,17 @@
 const REALTIME_MODEL = "gpt-realtime-mini";
 const REALTIME_URL = `https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
 
+// gpt-realtime-mini pricing (USD per token)
+// https://openai.com/api/pricing/
+const PRICING = {
+  textInput:   0.60  / 1_000_000,
+  textCached:  0.30  / 1_000_000,
+  textOutput:  2.40  / 1_000_000,
+  audioInput:  10.00 / 1_000_000,
+  audioCached: 0.30  / 1_000_000,
+  audioOutput: 20.00 / 1_000_000,
+};
+
 // Orb color — two states only (Realtime API is always listening)
 const STATE_COLORS: Record<string, number[]> = {
   active:       [0.29, 0.56, 0.96],  // blue
@@ -57,6 +68,8 @@ interface AppState {
   captionTimeout: ReturnType<typeof setTimeout> | null;
   // Transcript
   hasTranscriptContent: boolean;
+  // Cost tracking
+  sessionCost: number;
 }
 
 const state: AppState = {
@@ -88,6 +101,8 @@ const state: AppState = {
   captionTimeout: null,
   // Transcript
   hasTranscriptContent: false,
+  // Cost tracking
+  sessionCost: 0,
 };
 
 // ─── DOM References ───
@@ -106,6 +121,7 @@ const transcriptToggle = document.getElementById("transcript-toggle")!;
 const transcriptPanel = document.getElementById("transcript-panel")!;
 const transcript = document.getElementById("transcript")!;
 const stopBtn = document.getElementById("stop-btn") as HTMLButtonElement;
+const sessionCostEl = document.getElementById("session-cost")!;
 
 // ─── Event Listeners ───
 startBtn.addEventListener("click", startSession);
@@ -349,6 +365,43 @@ function setStatus(s: "connecting" | "listening" | "thinking" | "speaking" | "di
   statusTextActive.textContent = labels[s] || s;
 }
 
+// ─── Cost Tracking ───
+function calculateUsageCost(usage: any): number {
+  if (!usage) return 0;
+
+  const inp = usage.input_token_details || {};
+  const out = usage.output_token_details || {};
+  const cached = inp.cached_tokens_details || {};
+
+  const textIn   = (inp.text_tokens  || 0) - (cached.text_tokens  || 0);
+  const textCach = cached.text_tokens  || 0;
+  const audioIn  = (inp.audio_tokens || 0) - (cached.audio_tokens || 0);
+  const audioCach = cached.audio_tokens || 0;
+  const textOut  = out.text_tokens  || 0;
+  const audioOut = out.audio_tokens || 0;
+
+  return (
+    textIn    * PRICING.textInput  +
+    textCach  * PRICING.textCached +
+    audioIn   * PRICING.audioInput +
+    audioCach * PRICING.audioCached +
+    textOut   * PRICING.textOutput +
+    audioOut  * PRICING.audioOutput
+  );
+}
+
+function updateCostDisplay() {
+  const cost = state.sessionCost;
+  if (cost <= 0) {
+    sessionCostEl.classList.remove("visible");
+    return;
+  }
+  sessionCostEl.textContent = cost < 0.01
+    ? `$${cost.toFixed(4)}`
+    : `$${cost.toFixed(2)}`;
+  sessionCostEl.classList.add("visible");
+}
+
 // ─── Live Caption ───
 function setCaption(text: string, role = "assistant") {
   liveCaption.textContent = text;
@@ -453,6 +506,10 @@ async function startSession() {
     sessionSection.classList.add("active");
     stopBtn.style.display = "block";
     setStatus("connecting");
+
+    // Reset cost tracking
+    state.sessionCost = 0;
+    sessionCostEl.classList.remove("visible");
 
     // Init WebGL orb
     initOrbGL();
@@ -691,6 +748,12 @@ function handleServerEvent(event: any) {
             // Already handled by function_call_arguments.done
           }
         }
+      }
+      // Accumulate cost from usage
+      if (event.response?.usage) {
+        const cost = calculateUsageCost(event.response.usage);
+        state.sessionCost += cost;
+        updateCostDisplay();
       }
       if (!currentMsgEl) {
         setStatus("listening");

@@ -187,6 +187,17 @@
     #status-active .dot.speaking    { background: var(--status-red); animation: blink 0.6s ease-in-out infinite; box-shadow: 0 0 8px rgba(226,62,62,0.5); }
     #status-active .dot.disconnected { background: var(--text-muted); box-shadow: none; }
 
+    #session-cost {
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-muted);
+      margin-left: auto;
+      opacity: 0;
+      transition: opacity 0.8s ease;
+      user-select: text;
+    }
+    #session-cost.visible { opacity: 0.55; }
+
     /* ─── Orb ─── */
     #orb-container {
       position: relative;
@@ -403,6 +414,7 @@
           <span class="dot listening"></span>
           <span id="status-text-active">Listening...</span>
         </div>
+        <span id="session-cost"></span>
       </div>
 
       <div id="orb-container">
