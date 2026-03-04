@@ -67,6 +67,8 @@ interface AppState {
   spinSpeed: number;
   // Caption
   captionTimeout: ReturnType<typeof setTimeout> | null;
+  // Inactivity auto-shutdown (30s)
+  inactivityTimer: ReturnType<typeof setTimeout> | null;
   // Transcript
   hasTranscriptContent: boolean;
   // Cost tracking
@@ -101,6 +103,8 @@ const state: AppState = {
   spinSpeed: 0,
   // Caption
   captionTimeout: null,
+  // Inactivity auto-shutdown
+  inactivityTimer: null,
   // Transcript
   hasTranscriptContent: false,
   // Cost tracking
@@ -127,6 +131,9 @@ const sessionCostEl = document.getElementById("session-cost")!;
 startBtn.addEventListener("click", startSession);
 stopBtn.addEventListener("click", endSession);
 transcriptToggle.addEventListener("click", toggleTranscript);
+cartItems.addEventListener("scroll", () => {
+  cartItems.classList.toggle("scrolled", cartItems.scrollTop > 0);
+});
 
 // ═══════════════════════════════════════════════════════════════
 // WebGL Nebula Bloom Orb (FBM noise cloud)
@@ -366,6 +373,26 @@ function setStatus(s: "connecting" | "listening" | "thinking" | "speaking" | "di
   state.currentStatus = s;
 }
 
+// ─── Inactivity Auto-Shutdown ───
+const INACTIVITY_TIMEOUT_MS = 30_000;
+
+function resetInactivityTimer() {
+  if (state.inactivityTimer) clearTimeout(state.inactivityTimer);
+  state.inactivityTimer = setTimeout(() => {
+    console.log("Inactivity timeout — ending session");
+    addMessage("system", "Session ended due to inactivity.");
+    setCaption("Session ended due to inactivity.", "system");
+    endSession();
+  }, INACTIVITY_TIMEOUT_MS);
+}
+
+function clearInactivityTimer() {
+  if (state.inactivityTimer) {
+    clearTimeout(state.inactivityTimer);
+    state.inactivityTimer = null;
+  }
+}
+
 // ─── Cost Tracking ───
 function calculateUsageCost(usage: any): number {
   if (!usage) return 0;
@@ -476,6 +503,7 @@ function addCartItem(name: string, qty?: string, productCode?: string) {
     li.appendChild(qtySpan);
   }
   cartItems.appendChild(li);
+  cartItems.scrollTop = cartItems.scrollHeight;
 }
 
 function removeCartItem(productCode: string) {
@@ -597,6 +625,7 @@ async function startSession() {
     dc.onopen = () => {
       console.log("Data channel open, WebRTC connected");
       setStatus("listening");
+      resetInactivityTimer();
       // Prompt the agent to greet the user and explain what it can do
       sendDataChannelMessage({
         type: "conversation.item.create",
@@ -650,6 +679,7 @@ async function startSession() {
 }
 
 function endSession() {
+  clearInactivityTimer();
   // Stop mic
   if (state.localStream) {
     state.localStream.getTracks().forEach((t) => t.stop());
@@ -704,6 +734,7 @@ let currentMsgEl: HTMLElement | null = null;
 function handleServerEvent(event: any) {
   switch (event.type) {
     case "response.audio_transcript.delta":
+      resetInactivityTimer();
       setStatus("speaking");
       if (!currentMsgEl) {
         state.currentAssistantMsg = "";
@@ -726,6 +757,7 @@ function handleServerEvent(event: any) {
       break;
 
     case "input_audio_buffer.speech_started":
+      resetInactivityTimer();
       state.awaitingAudioDrain = false;
       clearCaption();
       break;
@@ -750,6 +782,7 @@ function handleServerEvent(event: any) {
       break;
 
     case "response.function_call_arguments.done":
+      resetInactivityTimer();
       state.awaitingAudioDrain = false;
       setStatus("thinking");
       handleToolCall(event);

@@ -254,7 +254,19 @@
       content: ''; display: block; width: 3px; height: 12px;
       background: var(--brand-red); border-radius: 2px;
     }
-    #cart-items { list-style: none; display: flex; flex-direction: column; }
+    #cart-items {
+      list-style: none; display: flex; flex-direction: column;
+      max-height: calc(4 * 45px);
+      overflow-y: auto;
+      -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 24px, black 100%);
+      mask-image: linear-gradient(to bottom, transparent 0%, black 24px, black 100%);
+    }
+    #cart-items:not(.scrolled) {
+      -webkit-mask-image: none;
+      mask-image: none;
+    }
+    #cart-items::-webkit-scrollbar { width: 4px; }
+    #cart-items::-webkit-scrollbar-thumb { background: rgba(42,60,130,0.2); border-radius: 4px; }
     #cart-items li {
       font-size: 14px; padding: 10px 0;
       border-bottom: 1px solid rgba(42,60,130,0.12);
