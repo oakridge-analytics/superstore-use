@@ -550,7 +550,10 @@ async function startSession() {
     // is wired up in pc.ontrack once the remote stream is available.
 
     console.log("Requesting ephemeral token...");
-    const tokenRes = await fetch("/token");
+    const voiceToken = document.querySelector<HTMLMetaElement>('meta[name="voice-token"]')?.content || "";
+    const tokenRes = await fetch("/token", {
+      headers: { Authorization: "Bearer " + voiceToken },
+    });
     if (!tokenRes.ok) throw new Error("Token request failed: " + tokenRes.status);
     const tokenData = await tokenRes.json();
     const ephemeralKey = tokenData.client_secret.value;

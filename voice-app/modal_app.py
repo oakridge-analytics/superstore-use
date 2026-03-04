@@ -20,10 +20,16 @@ PCX_BASE_HEADERS = {
 }
 
 BANNERS = {
-    "superstore": {"name": "Real Canadian Superstore", "cart_url": "https://www.realcanadiansuperstore.ca/en/cartReview"},
+    "superstore": {
+        "name": "Real Canadian Superstore",
+        "cart_url": "https://www.realcanadiansuperstore.ca/en/cartReview",
+    },
     "nofrills": {"name": "No Frills", "cart_url": "https://www.nofrills.ca/en/cartReview"},
     "loblaw": {"name": "Loblaws", "cart_url": "https://www.loblaws.ca/en/cartReview"},
-    "independent": {"name": "Your Independent Grocer", "cart_url": "https://www.yourindependentgrocer.ca/en/cartReview"},
+    "independent": {
+        "name": "Your Independent Grocer",
+        "cart_url": "https://www.yourindependentgrocer.ca/en/cartReview",
+    },
     "zehrs": {"name": "Zehrs", "cart_url": "https://www.zehrs.ca/en/cartReview"},
     "fortinos": {"name": "Fortinos", "cart_url": "https://www.fortinos.ca/en/cartReview"},
     "maxi": {"name": "Maxi", "cart_url": "https://www.maxi.ca/en/cartReview"},
@@ -37,6 +43,7 @@ BANNERS = {
 
 def pcx_headers(banner: str = "superstore") -> dict:
     return {**PCX_BASE_HEADERS, "basesiteid": banner, "site-banner": banner}
+
 
 SYSTEM_PROMPT = (
     "You are a friendly grocery shopping assistant for PC Express. "
@@ -86,7 +93,10 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "store_id": {"type": "string", "description": "The store ID to shop at"},
-                "banner": {"type": "string", "description": "The banner ID of the store (e.g. superstore, nofrills, loblaw)"},
+                "banner": {
+                    "type": "string",
+                    "description": "The banner ID of the store (e.g. superstore, nofrills, loblaw)",
+                },
             },
             "required": ["store_id", "banner"],
         },
@@ -166,7 +176,7 @@ def create_web_app():
 
     import httpx
     from fastapi import FastAPI, Request
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
     from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -180,8 +190,40 @@ def create_web_app():
 
     web_app.add_middleware(NoCacheMiddleware)
 
+    # Rate limiting: max 3 token requests per IP per 60s window
+    TOKEN_RATE_LIMIT = 3
+    TOKEN_RATE_WINDOW = 60  # seconds
+    token_requests: dict[str, list[float]] = {}
+
+    def _get_client_ip(request: Request) -> str:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return request.client.host if request.client else "unknown"
+
+    def _is_rate_limited(ip: str) -> bool:
+        import time
+
+        now = time.time()
+        timestamps = token_requests.get(ip, [])
+        # Prune old entries
+        timestamps = [t for t in timestamps if now - t < TOKEN_RATE_WINDOW]
+        token_requests[ip] = timestamps
+        if len(timestamps) >= TOKEN_RATE_LIMIT:
+            return True
+        timestamps.append(now)
+        return False
+
     @web_app.get("/token")
-    async def get_token():
+    async def get_token(request: Request):
+        expected = os.environ.get("VOICE_APP_TOKEN", "")
+        auth = request.headers.get("Authorization", "")
+        if not expected or not auth.startswith("Bearer ") or auth[7:] != expected:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+        ip = _get_client_ip(request)
+        if _is_rate_limited(ip):
+            print(f"[token] rate limited: {ip}")
+            return JSONResponse(status_code=429, content={"error": "Too many requests. Try again later."})
         api_key = os.environ["OPENAI_API_KEY"]
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -222,9 +264,7 @@ def create_web_app():
         print(f'[find-stores] Received query: "{query}"')
 
         # Canadian postal code: A1A 1A1 (letter-digit-letter space? digit-letter-digit)
-        CA_POSTAL_RE = re.compile(
-            r"^([A-Za-z]\d[A-Za-z])\s*(\d[A-Za-z]\d)$"
-        )
+        CA_POSTAL_RE = re.compile(r"^([A-Za-z]\d[A-Za-z])\s*(\d[A-Za-z]\d)$")
 
         def normalize_postal(raw: str) -> str | None:
             """If *raw* looks like a Canadian postal code, return it as 'A1A 1A1' (uppercase, single space)."""
@@ -306,10 +346,7 @@ def create_web_app():
             lng = float(geo_hit["lon"])
 
             # Query all banners in parallel
-            banner_tasks = {
-                banner: fetch_banner_locations(banner, client)
-                for banner in BANNERS
-            }
+            banner_tasks = {banner: fetch_banner_locations(banner, client) for banner in BANNERS}
             results = await asyncio.gather(*banner_tasks.values())
             all_locations = []
             for locs in results:
@@ -341,7 +378,9 @@ def create_web_app():
             for loc in sorted_locs[:3]
         ]
         for s in top3:
-            print(f"[find-stores]   #{s['storeId']} [{s['banner']}] {s['name']} — {s['distance_km']}km — {s['address']}")
+            print(
+                f"[find-stores]   #{s['storeId']} [{s['banner']}] {s['name']} — {s['distance_km']}km — {s['address']}"
+            )
         return {"stores": top3}
 
     @web_app.post("/api/create-cart")
@@ -566,7 +605,18 @@ def create_web_app():
 
     @web_app.get("/")
     async def index():
-        return FileResponse("/app/public/index.html")
+        # Inject the voice app token into the HTML so the frontend can
+        # authenticate against /token without exposing the OpenAI key.
+        import html as html_mod
+
+        token = html_mod.escape(os.environ.get("VOICE_APP_TOKEN", ""))
+        with open("/app/public/index.html") as f:
+            content = f.read()
+        content = content.replace(
+            "</head>",
+            f'  <meta name="voice-token" content="{token}">\n</head>',
+        )
+        return HTMLResponse(content)
 
     web_app.mount("/", StaticFiles(directory="/app/public"), name="static")
 
@@ -575,7 +625,11 @@ def create_web_app():
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("openai-secret"), modal.Secret.from_name("mapbox-api-key")],
+    secrets=[
+        modal.Secret.from_name("pc-express-voice-openai"),
+        modal.Secret.from_name("mapbox-api-key"),
+        modal.Secret.from_name("pc-express-voice-app-token"),
+    ],
     timeout=3600,
     cpu=0.25,
     memory=256,
