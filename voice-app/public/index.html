@@ -6,7 +6,7 @@
   <title>PC Express Voice</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg-void: #060610;
@@ -34,7 +34,7 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
     body {
-      font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
       background: var(--bg-void);
       color: var(--text-primary);
       min-height: 100vh;
@@ -155,7 +155,8 @@
     #session-section {
       display: none;
       flex-direction: column; align-items: center;
-      gap: 0; flex: 1; padding-top: 16px;
+      gap: 0; flex: 1; padding-top: 0;
+      justify-content: center;
       animation: fade-up 0.4s ease-out;
     }
     #session-section.active { display: flex; }
@@ -165,43 +166,25 @@
       to { opacity: 1; transform: translateY(0); }
     }
 
-    /* ─── Status Bar (session) ─── */
-    #status-bar {
-      display: flex; align-items: center; gap: 8px;
-      font-size: 12px; color: var(--text-secondary);
-      padding: 6px 14px;
-      background: var(--bg-glass);
-      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-      border: 1px solid var(--border-glass);
-      border-radius: 100px;
-      margin-bottom: 24px;
-    }
-    #status-active { display: flex; align-items: center; gap: 8px; font-weight: 500; letter-spacing: 0.3px; }
-    #status-active .dot {
-      width: 7px; height: 7px; border-radius: 50%;
-      transition: background 0.3s, box-shadow 0.3s;
-    }
-    #status-active .dot.connecting { background: var(--status-amber); box-shadow: 0 0 8px rgba(240,160,48,0.5); }
-    #status-active .dot.listening   { background: var(--status-green); box-shadow: 0 0 8px rgba(52,208,104,0.5); }
-    #status-active .dot.thinking    { background: var(--status-blue); animation: blink 1s ease-in-out infinite; box-shadow: 0 0 8px rgba(74,142,245,0.5); }
-    #status-active .dot.speaking    { background: var(--status-red); animation: blink 0.6s ease-in-out infinite; box-shadow: 0 0 8px rgba(226,62,62,0.5); }
-    #status-active .dot.disconnected { background: var(--text-muted); box-shadow: none; }
-
+    /* ─── Session Cost (top-right corner) ─── */
     #session-cost {
+      position: fixed;
+      top: 48px;
+      right: 24px;
       font-size: 11px;
       font-variant-numeric: tabular-nums;
       color: var(--text-muted);
-      margin-left: auto;
       opacity: 0;
       transition: opacity 0.8s ease;
       user-select: text;
+      z-index: 10;
     }
     #session-cost.visible { opacity: 0.55; }
 
     /* ─── Orb ─── */
     #orb-container {
       position: relative;
-      width: 260px; height: 260px;
+      width: 174px; height: 174px;
       display: flex; align-items: center; justify-content: center;
       flex-shrink: 0;
     }
@@ -210,9 +193,8 @@
       inset: -60px;
       border-radius: 50%;
       background: rgba(74,142,245,0.25);
-      filter: blur(80px);
+      filter: blur(60px);
       pointer-events: none;
-      transition: background 0.8s ease;
     }
     #orb-clip {
       position: relative;
@@ -230,7 +212,7 @@
     /* ─── Live Caption ─── */
     #live-caption {
       width: 100%;
-      min-height: 44px;
+      height: 110px;
       padding: 10px 20px;
       text-align: center;
       font-size: 15px;
@@ -238,8 +220,15 @@
       color: var(--text-primary);
       opacity: 0;
       transition: opacity 0.35s ease;
+      margin-top: 16px;
       margin-bottom: 16px;
+      overflow-y: auto;
+      -webkit-mask-image: linear-gradient(to bottom, black 65%, transparent 100%);
+      mask-image: linear-gradient(to bottom, black 65%, transparent 100%);
     }
+    #live-caption::-webkit-scrollbar { width: 3px; }
+    #live-caption::-webkit-scrollbar-track { background: transparent; }
+    #live-caption::-webkit-scrollbar-thumb { background: rgba(42,60,130,0.3); border-radius: 3px; }
     #live-caption.visible { opacity: 1; }
     #live-caption.role-user { color: #a0b8e8; font-style: italic; }
     #live-caption.role-system { color: var(--text-muted); font-size: 12px; letter-spacing: 0.2px; }
@@ -328,7 +317,7 @@
 
     .msg {
       padding: 10px 14px; border-radius: var(--radius-md);
-      font-size: 13px; line-height: 1.55; max-width: 85%; word-wrap: break-word;
+      font-size: 14px; line-height: 1.55; max-width: 85%; word-wrap: break-word;
       animation: msg-in 0.25s ease-out;
     }
     @keyframes msg-in {
@@ -361,6 +350,7 @@
       color: var(--text-secondary); border-radius: var(--radius-md);
       cursor: pointer; font-size: 13px; font-weight: 500; font-family: inherit;
       transition: all 0.2s; letter-spacing: 0.3px;
+      flex-shrink: 0;
     }
     #stop-btn:hover { border-color: rgba(226,62,62,0.4); color: var(--brand-red); background: rgba(226,62,62,0.05); }
 
@@ -373,14 +363,15 @@
       #start-btn svg { width: 30px; height: 30px; }
       .mic-ring::before { width: 120px; height: 120px; }
       .mic-ring::after { width: 104px; height: 104px; }
-      #orb-container { width: 200px; height: 200px; }
+      #orb-container { width: 134px; height: 134px; }
       #live-caption { font-size: 14px; padding: 8px 16px; }
+      #session-cost { top: 44px; right: 16px; }
     }
     @media (min-width: 768px) {
       header { padding: 18px 32px; }
       main { padding: 0 24px 40px; }
       #start-section { padding: 80px 0; }
-      #orb-container { width: 300px; height: 300px; }
+      #orb-container { width: 200px; height: 200px; }
     }
   </style>
 </head>
@@ -409,13 +400,7 @@
 
     <!-- Session screen -->
     <div id="session-section">
-      <div id="status-bar">
-        <div id="status-active">
-          <span class="dot listening"></span>
-          <span id="status-text-active">Listening...</span>
-        </div>
-        <span id="session-cost"></span>
-      </div>
+      <span id="session-cost"></span>
 
       <div id="orb-container">
         <div id="orb-glow"></div>

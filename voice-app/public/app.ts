@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
 // PC Express Voice — app.ts
-// Voice-reactive soft glow orb + live caption + collapsible transcript
+// Voice-reactive soft glow orb + live caption + always-visible transcript
 // ═══════════════════════════════════════════════════════════════
 
 // ─── Constants ───
@@ -18,7 +18,7 @@ const PRICING = {
   audioOutput: 20.00 / 1_000_000,
 };
 
-// Orb color — two states only (Realtime API is always listening)
+// Orb colors — two states only
 const STATE_COLORS: Record<string, number[]> = {
   active:       [0.29, 0.56, 0.96],  // blue
   disconnected: [0.35, 0.38, 0.50],  // muted gray
@@ -57,6 +57,7 @@ interface AppState {
   analyserData: Uint8Array | null;
   smoothedAudioLevel: number;
   remoteSource: AudioNode | null;
+  awaitingAudioDrain: boolean;
   // Orb
   currentStatus: string;
   orbColor: number[];
@@ -90,6 +91,7 @@ const state: AppState = {
   analyserData: null,
   smoothedAudioLevel: 0,
   remoteSource: null,
+  awaitingAudioDrain: false,
   // Orb
   currentStatus: "disconnected",
   orbColor: [0.35, 0.38, 0.50],
@@ -109,8 +111,6 @@ const state: AppState = {
 const startBtn = document.getElementById("start-btn") as HTMLButtonElement;
 const startSection = document.getElementById("start-section")!;
 const sessionSection = document.getElementById("session-section")!;
-const statusTextActive = document.getElementById("status-text-active")!;
-const statusDot = document.querySelector("#status-active .dot") as HTMLElement;
 const orbGlow = document.getElementById("orb-glow")!;
 const orbClip = document.getElementById("orb-clip")!;
 const liveCaption = document.getElementById("live-caption")!;
@@ -282,6 +282,12 @@ function renderOrbFrame(time: number) {
     state.smoothedAudioLevel += (0 - state.smoothedAudioLevel) * 0.012;
   }
 
+  // Audio drain detection: transition to listening when audio actually goes silent
+  if (state.awaitingAudioDrain && state.smoothedAudioLevel < 0.005) {
+    state.awaitingAudioDrain = false;
+    setStatus("listening");
+  }
+
   const level = state.smoothedAudioLevel;
 
   // Orb color: active (blue) vs disconnected (gray)
@@ -320,14 +326,18 @@ function renderOrbFrame(time: number) {
 
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  // Update glow color and intensity — subtle changes only
+  // Update glow color and intensity — highly reactive to audio
   const c = state.orbColor;
   const r = Math.round(c[0] * 255);
   const g = Math.round(c[1] * 255);
   const b = Math.round(c[2] * 255);
-  const glowOpacity = 0.14 + level * 1.6;
-  orbGlow.style.background = `rgba(${r}, ${g}, ${b}, ${glowOpacity})`;
-  orbClip.style.boxShadow = `0 0 ${60 + level * 40}px rgba(${r}, ${g}, ${b}, ${0.2 + level * 0.15})`;
+  const glowOpacity = 0.08 + level * 3.0;
+  const glowInset = -50 - level * 100;
+  const blurSize = 50 + level * 60;
+  orbGlow.style.background = `rgba(${r}, ${g}, ${b}, ${Math.min(glowOpacity, 1)})`;
+  orbGlow.style.inset = `${glowInset}px`;
+  orbGlow.style.filter = `blur(${blurSize}px)`;
+  orbClip.style.boxShadow = `0 0 ${60 + level * 160}px rgba(${r}, ${g}, ${b}, ${0.15 + level * 0.6})`;
 
   // Subtle breathing scale — shader handles all rotation
   const scale = 1 + level * 0.12;
@@ -354,15 +364,6 @@ function stopOrbLoop() {
 
 function setStatus(s: "connecting" | "listening" | "thinking" | "speaking" | "disconnected") {
   state.currentStatus = s;
-  const labels: Record<string, string> = {
-    connecting: "Connecting...",
-    listening: "Listening...",
-    thinking: "Thinking...",
-    speaking: "Speaking...",
-    disconnected: "Disconnected",
-  };
-  statusDot.className = "dot " + s;
-  statusTextActive.textContent = labels[s] || s;
 }
 
 // ─── Cost Tracking ───
@@ -404,29 +405,32 @@ function updateCostDisplay() {
 
 // ─── Live Caption ───
 function setCaption(text: string, role = "assistant") {
-  liveCaption.textContent = text;
+  // Show beginning of text, truncate at 350 characters
+  liveCaption.textContent = text.length > 350 ? text.slice(0, 350) + "…" : text;
   liveCaption.className = "visible role-" + role;
+  // Show beginning of text, not the end
+  liveCaption.scrollTop = 0;
 
   if (state.captionTimeout) {
     clearTimeout(state.captionTimeout);
     state.captionTimeout = null;
   }
 
-  // Auto-fade user and system captions after a delay
-  if (role !== "assistant") {
+  // System captions fade after a delay; assistant and user captions
+  // stay visible until the next caption replaces them.
+  if (role === "system") {
     state.captionTimeout = setTimeout(() => {
       liveCaption.classList.remove("visible");
     }, 3000);
   }
 }
 
-function fadeCaption() {
+function clearCaption() {
   if (state.captionTimeout) {
     clearTimeout(state.captionTimeout);
+    state.captionTimeout = null;
   }
-  state.captionTimeout = setTimeout(() => {
-    liveCaption.classList.remove("visible");
-  }, 2500);
+  liveCaption.classList.remove("visible");
 }
 
 // ─── Transcript (hidden panel) ───
@@ -446,6 +450,16 @@ function addMessage(role: "assistant" | "user" | "system", text: string): HTMLEl
   }
 
   return el;
+}
+
+// ─── Transcript Toggle ───
+function toggleTranscript() {
+  const isExpanded = transcriptPanel.classList.toggle("expanded");
+  transcriptToggle.classList.toggle("expanded", isExpanded);
+  transcriptToggle.querySelector("span")!.textContent = isExpanded ? "Hide transcript" : "Show transcript";
+  if (isExpanded) {
+    transcriptPanel.scrollTop = transcriptPanel.scrollHeight;
+  }
 }
 
 // ─── Cart ───
@@ -484,16 +498,6 @@ function showCartLink() {
     a.href = `${baseUrl}?forceCartId=${state.cart_id}`;
   }
   cartLink.style.display = "block";
-}
-
-// ─── Transcript Toggle ───
-function toggleTranscript() {
-  const isExpanded = transcriptPanel.classList.toggle("expanded");
-  transcriptToggle.classList.toggle("expanded", isExpanded);
-  transcriptToggle.querySelector("span")!.textContent = isExpanded ? "Hide transcript" : "Show transcript";
-  if (isExpanded) {
-    transcriptPanel.scrollTop = transcriptPanel.scrollHeight;
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -606,6 +610,7 @@ async function startSession() {
     };
 
     dc.onclose = () => {
+      state.awaitingAudioDrain = false;
       setStatus("disconnected");
     };
 
@@ -632,6 +637,7 @@ async function startSession() {
 
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+        state.awaitingAudioDrain = false;
         setStatus("disconnected");
       }
     };
@@ -655,6 +661,7 @@ function endSession() {
     state.pc = null;
   }
   state.dc = null;
+  state.awaitingAudioDrain = false;
   // Release audio
   if (state.audioEl) {
     state.audioEl.srcObject = null;
@@ -713,11 +720,14 @@ function handleServerEvent(event: any) {
       }
       currentMsgEl = null;
       state.currentAssistantMsg = "";
-      setStatus("listening");
+      // Don't immediately set listening — wait for audio to actually drain.
+      // Caption stays visible until user speaks or a new caption replaces it.
+      state.awaitingAudioDrain = true;
       break;
 
     case "input_audio_buffer.speech_started":
-      liveCaption.classList.remove("visible");
+      state.awaitingAudioDrain = false;
+      clearCaption();
       break;
 
     case "conversation.item.input_audio_transcription.completed":
@@ -740,6 +750,7 @@ function handleServerEvent(event: any) {
       break;
 
     case "response.function_call_arguments.done":
+      state.awaitingAudioDrain = false;
       setStatus("thinking");
       handleToolCall(event);
       break;
@@ -789,20 +800,32 @@ async function handleToolCall(event: any) {
   addMessage("system", `Looking up: ${label}...`);
   setCaption(`Looking up: ${label}...`, "system");
 
+  // Auto-create cart if a store_id is available but no cart exists yet
+  const needsCart = ["search_products", "add_to_cart", "remove_from_cart"].includes(name);
+  if (needsCart && !state.cart_id) {
+    const storeId = args.store_id || state.store_id;
+    const banner = args.banner || state.banner || "superstore";
+    if (storeId) {
+      try {
+        const cartResult = await callBackend("select_store", { store_id: storeId, banner });
+        if (cartResult.cart_id) {
+          state.cart_id = cartResult.cart_id;
+          state.store_id = storeId;
+          state.banner = cartResult.banner || banner;
+          state.cart_url = cartResult.cart_url || null;
+          console.log(`Auto-created cart ${state.cart_id} for store ${storeId}`);
+        }
+      } catch (err: any) {
+        console.error("Failed to auto-create cart:", err);
+      }
+    }
+  }
+
   let result: any;
   try {
     result = await callBackend(name, args);
   } catch (err: any) {
     result = { error: err.message };
-  }
-
-  if (name === "select_store" && result.cart_id) {
-    state.cart_id = result.cart_id;
-    state.store_id = args.store_id || result.store_id;
-    state.banner = result.banner || args.banner || "superstore";
-    state.cart_url = result.cart_url || null;
-    addMessage("system", "Store selected, cart created.");
-    setCaption("Store selected, cart created.", "system");
   }
 
   if (name === "search_products" && result.products) {
