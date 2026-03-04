@@ -455,7 +455,7 @@ def view_cart_streaming() -> Generator[dict, None, str]:
 
     except modal.exception.NotFoundError:
         error_msg = (
-            f"Error: Modal app '{MODAL_APP_NAME}' not found. Please deploy it first with: modal deploy modal/app.py"
+            f"Error: Modal app '{MODAL_APP_NAME}' not found. Please deploy it first with: modal deploy browser-use-app/app.py"
         )
         yield {"type": "error", "message": error_msg}
         return error_msg

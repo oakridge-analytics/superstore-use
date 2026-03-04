@@ -5,8 +5,8 @@ Single unified deployment with:
 - Core browser automation functions (login, add items)
 - Chat-based web UI with LangGraph agent
 
-Deploy with: modal deploy modal/app.py
-Run locally: modal serve modal/app.py
+Deploy with: modal deploy browser-use-app/app.py
+Run locally: modal serve browser-use-app/app.py
 """
 
 import asyncio
@@ -118,8 +118,8 @@ chat_image = (
     .add_local_dir("src", remote_path="/root/src", copy=True)
     .add_local_file("config.toml", remote_path="/app/config.toml", copy=True)
     .add_local_dir("src/prompts", remote_path="/app/prompts", copy=True)
-    .add_local_dir("modal/templates", remote_path="/app/templates", copy=True)
-    .add_local_dir("modal/static", remote_path="/app/static", copy=True)
+    .add_local_dir("browser-use-app/templates", remote_path="/app/templates", copy=True)
+    .add_local_dir("browser-use-app/static", remote_path="/app/static", copy=True)
 )
 
 
@@ -914,7 +914,7 @@ def upload_profile():
 
     Usage:
         1. First login locally: uv run -m src.local.cli login
-        2. Then upload to Modal: uv run modal run modal/app.py::upload_profile
+        2. Then upload to Modal: uv run modal run browser-use-app/app.py::upload_profile
 
     This solves the CI/CD deployment issue where the image-embedded profile
     is empty. The Modal volume persists independently of deployments.

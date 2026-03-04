@@ -78,7 +78,7 @@ Go to [https://modal.com/secrets](https://modal.com/secrets) and create:
 ### 4. Deploy
 
 ```bash
-uv run modal deploy modal/app.py
+uv run modal deploy browser-use-app/app.py
 ```
 
 Your web UI will be available at the URL shown in the output.
@@ -139,7 +139,7 @@ Configs are in `conf/` directory (Hydra-based):
 
 ```
 superstore-use/
-  modal/              # Modal deployment
+  browser-use-app/    # Modal deployment
     app.py            # Main Modal app
     templates/        # Web UI HTML
     static/           # CSS & JavaScript
@@ -153,7 +153,7 @@ superstore-use/
 ```
 
 **Local:** Runs with visible browser windows using `src.local.cli`
-**Modal:** Serverless cloud deployment with web UI at `modal/app.py`
+**Modal:** Serverless cloud deployment with web UI at `browser-use-app/app.py`
 
 ## Security
 
@@ -180,8 +180,8 @@ uv run -m src.eval.cli --cfg job       # View resolved config
 uv run -m src.eval.cli browse <path>   # Browse temp profile from eval run
 
 # Modal
-uv run modal deploy modal/app.py     # Deploy to cloud
-uv run modal serve modal/app.py      # Local development with hot-reload
+uv run modal deploy browser-use-app/app.py     # Deploy to cloud
+uv run modal serve browser-use-app/app.py      # Local development with hot-reload
 uv run modal app list                # List deployed apps
 uv run modal app logs superstore-agent  # Stream logs
 ```

@@ -22,7 +22,7 @@ jobs:
         with:
           filters: |
             agent:
-              - 'modal/**'
+              - 'browser-use-app/**'
               - 'src/**'
               - 'uv.lock'
             voice:
@@ -55,7 +55,7 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: |
-          uv run modal deploy modal/app.py
+          uv run modal deploy browser-use-app/app.py
 
   deploy-voice:
     needs: changes

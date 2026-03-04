@@ -11,7 +11,7 @@ src/
 ├── eval/           # Evaluation harness: uv run -m src.eval.cli
 └── prompts/        # Prompt templates (login.md, add_item.md, checkout.md)
 conf/               # Hydra configs (llm/, browser/, prompt/, judge/, experiment/)
-modal/app.py        # Modal deployment
+browser-use-app/app.py  # Modal deployment
 ```
 
 ## Entry Points
@@ -21,7 +21,7 @@ modal/app.py        # Modal deployment
 | `uv run -m src.local.cli login` | Save browser profile |
 | `uv run -m src.local.cli shop` | Local shopping |
 | `uv run -m src.eval.cli` | Run evaluation harness |
-| `uv run modal deploy modal/app.py` | Deploy to Modal |
+| `uv run modal deploy browser-use-app/app.py` | Deploy to Modal |
 
 ## Quick Start
 
@@ -77,8 +77,8 @@ uv run -m src.eval.cli --help                    # Full options
 See [agent_docs/modal.md](agent_docs/modal.md) for detailed guidelines.
 
 ```bash
-uv run modal deploy modal/app.py      # Deploy
-uv run modal serve modal/app.py       # Dev with hot-reload
+uv run modal deploy browser-use-app/app.py      # Deploy
+uv run modal serve browser-use-app/app.py       # Dev with hot-reload
 uv run modal app logs superstore-agent  # Stream logs
 ```
 
