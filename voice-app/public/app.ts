@@ -866,7 +866,11 @@ async function handleToolCall(event: any) {
   if (name === "search_products" && result.products) {
     for (const p of result.products) {
       if (p.code && p.name) {
-        state.productNames[p.code] = p.brand ? `${p.brand} ${p.name}` : p.name;
+        let displayName = p.brand ? `${p.brand} ${p.name}` : p.name;
+        if (p.packageSize && p.packageUnit) {
+          displayName += ` (${p.packageSize} ${p.packageUnit})`;
+        }
+        state.productNames[p.code] = displayName;
       }
     }
   }
