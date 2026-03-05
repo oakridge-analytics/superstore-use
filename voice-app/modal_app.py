@@ -283,7 +283,7 @@ def create_web_app():
                     "instructions": SYSTEM_PROMPT,
                     "tools": TOOLS,
                     "input_audio_transcription": {
-                        "model": "whisper-1",
+                        "model": "gpt-4o-mini-transcribe-2025-12-15",
                     },
                     "turn_detection": {
                         "type": "server_vad",
