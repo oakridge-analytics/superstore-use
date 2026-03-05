@@ -125,12 +125,14 @@ const transcriptToggle = document.getElementById("transcript-toggle")!;
 const transcriptPanel = document.getElementById("transcript-panel")!;
 const transcript = document.getElementById("transcript")!;
 const stopBtn = document.getElementById("stop-btn") as HTMLButtonElement;
-const sessionCostEl = document.getElementById("session-cost")!;
+const costToggle = document.getElementById("cost-toggle")!;
+const costValueEl = costToggle.querySelector(".cost-value") as HTMLSpanElement;
 
 // ─── Event Listeners ───
 startBtn.addEventListener("click", startSession);
 stopBtn.addEventListener("click", endSession);
 transcriptToggle.addEventListener("click", toggleTranscript);
+costToggle.addEventListener("click", () => costToggle.classList.toggle("expanded"));
 cartItems.addEventListener("scroll", () => {
   cartItems.classList.toggle("scrolled", cartItems.scrollTop > 0);
 });
@@ -421,13 +423,13 @@ function calculateUsageCost(usage: any): number {
 function updateCostDisplay() {
   const cost = state.sessionCost;
   if (cost <= 0) {
-    sessionCostEl.classList.remove("visible");
+    costToggle.classList.remove("visible");
     return;
   }
-  sessionCostEl.textContent = cost < 0.01
+  costValueEl.textContent = cost < 0.01
     ? `$${cost.toFixed(4)}`
     : `$${cost.toFixed(2)}`;
-  sessionCostEl.classList.add("visible");
+  costToggle.classList.add("visible");
 }
 
 // ─── Live Caption ───
@@ -541,7 +543,7 @@ async function startSession() {
 
     // Reset cost tracking
     state.sessionCost = 0;
-    sessionCostEl.classList.remove("visible");
+    costToggle.classList.remove("visible", "expanded");
 
     // Init WebGL orb
     initOrbGL();
