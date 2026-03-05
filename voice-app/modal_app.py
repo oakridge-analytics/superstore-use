@@ -485,15 +485,34 @@ def create_web_app():
             if not shoppable or stock != "OK":
                 print(f"[search]   SKIP {p.get('code')} {p.get('name')!r} (shoppable={shoppable}, stock={stock})")
                 continue
-            price_obj = p.get("prices", {}).get("price", {}) or {}
+            prices = p.get("prices", {})
+            price_obj = prices.get("price", {}) or {}
+            product_price = price_obj.get("value") or p.get("price")
+
+            # Calculate package size from comparison prices (same approach as eval cart_checker)
+            comp_prices = prices.get("comparisonPrices", [])
+            package_size = None
+            package_unit = None
+            if comp_prices and product_price is not None:
+                comp = comp_prices[0]
+                try:
+                    size_value = (product_price / comp["price"]) * comp["quantity"]
+                    size_rounded = round(size_value) if size_value >= 10 else round(size_value, 1)
+                    package_size = size_rounded
+                    package_unit = comp.get("unit", "")
+                except (ZeroDivisionError, KeyError, TypeError):
+                    pass
+
             item = {
                 "code": p.get("code"),
                 "name": p.get("name"),
                 "brand": p.get("brand"),
-                "price": price_obj.get("value") or p.get("price"),
+                "price": product_price,
                 "unit": price_obj.get("unit", ""),
+                "packageSize": package_size,
+                "packageUnit": package_unit,
             }
-            print(f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} ${item['price']} / {item['unit']}")
+            print(f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} ${item['price']} / {item['unit']} ({package_size} {package_unit})")
             results.append(item)
         return {"products": results}
 
