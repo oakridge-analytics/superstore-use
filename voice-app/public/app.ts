@@ -51,6 +51,7 @@ interface AppState {
   currentAssistantMsg: string;
   currentResponseId: string | null;
   productNames: Record<string, string>;
+  productSizes: Record<string, string>;
   // Audio analysis
   audioCtx: AudioContext | null;
   analyser: AnalyserNode | null;
@@ -87,6 +88,7 @@ const state: AppState = {
   currentAssistantMsg: "",
   currentResponseId: null,
   productNames: {},
+  productSizes: {},
   // Audio analysis
   audioCtx: null,
   analyser: null,
@@ -492,18 +494,29 @@ function toggleTranscript() {
 }
 
 // ─── Cart ───
-function addCartItem(name: string, qty?: string, productCode?: string) {
+function addCartItem(name: string, qty?: string, productCode?: string, size?: string) {
   cartSection.classList.add("active");
   const li = document.createElement("li");
   if (productCode) li.dataset.productCode = productCode;
   const nameSpan = document.createElement("span");
+  nameSpan.className = "cart-item-name";
   nameSpan.textContent = name;
   li.appendChild(nameSpan);
+  const badgeWrap = document.createElement("span");
+  badgeWrap.className = "cart-item-badges";
+  if (size) {
+    const sizeSpan = document.createElement("span");
+    sizeSpan.className = "cart-badge cart-badge-size";
+    sizeSpan.textContent = size;
+    badgeWrap.appendChild(sizeSpan);
+  }
   if (qty) {
     const qtySpan = document.createElement("span");
+    qtySpan.className = "cart-badge cart-badge-qty";
     qtySpan.textContent = qty;
-    li.appendChild(qtySpan);
+    badgeWrap.appendChild(qtySpan);
   }
+  li.appendChild(badgeWrap);
   cartItems.appendChild(li);
   cartItems.scrollTop = cartItems.scrollHeight;
 }
@@ -866,11 +879,11 @@ async function handleToolCall(event: any) {
   if (name === "search_products" && result.products) {
     for (const p of result.products) {
       if (p.code && p.name) {
-        let displayName = p.brand ? `${p.brand} ${p.name}` : p.name;
-        if (p.packageSize && p.packageUnit) {
-          displayName += ` (${p.packageSize} ${p.packageUnit})`;
-        }
+        const displayName = p.brand ? `${p.brand} ${p.name}` : p.name;
         state.productNames[p.code] = displayName;
+        if (p.packageSize && p.packageUnit) {
+          state.productSizes[p.code] = `${p.packageSize} ${p.packageUnit}`;
+        }
       }
     }
   }
@@ -879,7 +892,8 @@ async function handleToolCall(event: any) {
     if (result.added_items && result.added_items.length > 0) {
       for (const item of result.added_items) {
         const displayName = state.productNames[item.product_code] || item.name || item.product_code;
-        addCartItem(displayName, `x${item.quantity}`, item.product_code);
+        const size = state.productSizes[item.product_code];
+        addCartItem(displayName, `x${item.quantity}`, item.product_code, size);
       }
       showCartLink();
     }

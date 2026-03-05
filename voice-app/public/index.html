@@ -282,13 +282,26 @@
       font-size: 14px; padding: 10px 0;
       border-bottom: 1px solid rgba(42,60,130,0.12);
       display: flex; justify-content: space-between; align-items: center;
+      gap: 8px;
     }
     #cart-items li:last-child { border-bottom: none; }
-    #cart-items li span:last-child {
-      color: var(--text-secondary) !important;
-      font-size: 13px; font-weight: 500;
+    .cart-item-name {
+      flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .cart-item-badges {
+      display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+    }
+    .cart-badge {
+      font-size: 12px; font-weight: 500;
+      padding: 2px 10px; border-radius: 100px; white-space: nowrap;
+    }
+    .cart-badge-size {
+      color: var(--text-secondary);
+      background: rgba(42,130,80,0.14);
+    }
+    .cart-badge-qty {
+      color: var(--text-secondary);
       background: rgba(42,60,130,0.12);
-      padding: 2px 10px; border-radius: 100px;
     }
 
     #cart-link { display: none; margin-top: 16px; }
