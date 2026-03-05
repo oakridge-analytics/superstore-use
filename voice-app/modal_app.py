@@ -61,6 +61,7 @@ You are a friendly, efficient voice shopping assistant for PC Express. You help 
 # Greeting
 
 - Introduce yourself briefly: you can help with recipe ideas or adding items straight to their PC Express cart.
+- Let the user know they can interrupt you anytime.
 - Do NOT ask for their location right away. Let them lead.
 - IF the user immediately starts listing items, skip pleasantries and ask for their location so you can find a store.
 
@@ -204,6 +205,8 @@ def create_web_app():
     import math
     import os
     import re
+    import uuid
+    from datetime import datetime, timezone
     from urllib.parse import quote
 
     import httpx
@@ -213,6 +216,11 @@ def create_web_app():
     from starlette.middleware.base import BaseHTTPMiddleware
 
     web_app = FastAPI()
+
+    def _log(event: str, **kw):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        parts = " ".join(f"{k}={v}" for k, v in kw.items())
+        print(f"[{ts}] [{event}] {parts}")
 
     class NoCacheMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -254,8 +262,13 @@ def create_web_app():
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
         ip = _get_client_ip(request)
         if _is_rate_limited(ip):
-            print(f"[token] rate limited: {ip}")
+            _log("session_blocked", reason="rate_limit", ip=ip)
             return JSONResponse(status_code=429, content={"error": "Too many requests. Try again later."})
+
+        session_id = uuid.uuid4().hex[:12]
+        user_agent = request.headers.get("user-agent", "")[:100]
+        _log("session_start", session_id=session_id, ip=ip, ua=f'"{user_agent}"')
+
         api_key = os.environ["OPENAI_API_KEY"]
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -281,10 +294,14 @@ def create_web_app():
                     "input_audio_noise_reduction": {
                         "type": "near_field",
                     },
+                    "tracing": {
+                        "workflow_name": "pc-express-voice",
+                        "group_id": session_id,
+                    },
                 },
             )
         data = resp.json()
-        print(f"[token] created, model={data.get('model', '?')}")
+        _log("session_ready", session_id=session_id, model=data.get("model", "?"))
         return data
 
     @web_app.post("/api/find-stores")
@@ -293,7 +310,7 @@ def create_web_app():
 
         body = await request.json()
         query = body.get("location") or body.get("postal_code") or ""
-        print(f'[find-stores] Received query: "{query}"')
+        _log("find_stores", query=f'"{query}"')
 
         # Canadian postal code: A1A 1A1 (letter-digit-letter space? digit-letter-digit)
         CA_POSTAL_RE = re.compile(r"^([A-Za-z]\d[A-Za-z])\s*(\d[A-Za-z]\d)$")
@@ -420,7 +437,7 @@ def create_web_app():
         body = await request.json()
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
-        print(f"[create-cart] Creating cart for store_id={store_id}, banner={banner}")
+        _log("create_cart", store_id=store_id, banner=banner)
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts",
@@ -430,7 +447,7 @@ def create_web_app():
         data = resp.json()
         cart_id = data.get("cartId") or data.get("id")
         cart_url = BANNERS.get(banner, BANNERS["superstore"])["cart_url"]
-        print(f"[create-cart] HTTP {resp.status_code}, cart_id={cart_id}")
+        _log("create_cart_done", cart_id=cart_id, status=resp.status_code)
         if resp.status_code != 200:
             print(f"[create-cart] Error response: {json.dumps(data, indent=2)}")
         return {"cart_id": cart_id, "store_id": store_id, "banner": banner, "cart_url": cart_url}
@@ -441,7 +458,7 @@ def create_web_app():
         term = body.get("term")
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
-        print(f'[search] Searching "{term}" at store {store_id} (banner={banner})')
+        _log("search", term=f'"{term}"', store_id=store_id, banner=banner)
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{PCX_BASE}/products/search",
@@ -488,7 +505,7 @@ def create_web_app():
         banner = body.get("banner", "superstore")
         items = body.get("items", [])
 
-        print(f"[add-to-cart] Adding {len(items)} item(s) to cart {cart_id} at store {store_id} (banner={banner})")
+        _log("add_to_cart", items=len(items), cart_id=cart_id, store_id=store_id, banner=banner)
         for item in items:
             print(f"[add-to-cart]   {item['product_code']} x{item['quantity']}")
 
@@ -564,7 +581,7 @@ def create_web_app():
         banner = body.get("banner", "superstore")
         items = body.get("items", [])
 
-        print(f"[remove-from-cart] Removing {len(items)} item(s) from cart {cart_id} (banner={banner})")
+        _log("remove_from_cart", items=len(items), cart_id=cart_id, banner=banner)
         for item in items:
             print(f"[remove-from-cart]   {item['product_code']}")
 
@@ -632,7 +649,7 @@ def create_web_app():
         banner = body.get("banner", "superstore")
         base_url = BANNERS.get(banner, BANNERS["superstore"])["cart_url"]
         cart_url = f"{base_url}?forceCartId={cart_id}" if cart_id else None
-        print(f"[finish-shopping] cart_id={cart_id}, banner={banner}, cart_url={cart_url}")
+        _log("finish_shopping", cart_id=cart_id, banner=banner)
         return {"success": True, "message": "Shopping session complete", "cart_url": cart_url}
 
     @web_app.get("/")

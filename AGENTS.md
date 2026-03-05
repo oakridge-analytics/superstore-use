@@ -1,108 +1,61 @@
-## Project Overview
+## Overview
 
-AI-powered grocery shopping agent for **Real Canadian Superstore** using `browser-use` for browser automation.
+AI-powered grocery shopping — voice agent + browser automation. See [README.md](README.md) for full details.
 
-## Architecture
+ALWAYS use `uv` to run Python. See `.env.example` for required env vars.
+
+## Directory Layout
 
 ```
+voice-app/
+  modal_app.py              # Voice backend (FastAPI on Modal)
+  public/app.ts             # Frontend (WebRTC, WebGL orb, audio)
+  public/index.html         # Markup + CSS
+browser-use-app/
+  app.py                    # Browser agent (Modal + LangGraph)
+  templates/                # Chat web UI
+  static/                   # CSS & JS
 src/
-├── core/           # Shared utilities (browser.py, config.py, success.py, agent.py)
-├── local/cli.py    # Local CLI: uv run -m src.local.cli
-├── eval/           # Evaluation harness: uv run -m src.eval.cli
-└── prompts/        # Prompt templates (login.md, add_item.md, checkout.md)
-conf/               # Hydra configs (llm/, browser/, prompt/, judge/, experiment/)
-browser-use-app/app.py  # Modal deployment
+  core/                     # Shared: browser.py, config.py, agent.py, success.py
+  local/cli.py              # Local CLI
+  eval/                     # Eval harness: harness.py, config.py, cart_checker.py
+  prompts/                  # Prompt templates (login.md, add_item.md, etc.)
+conf/                       # Hydra configs
+  config.yaml               # Base config
+  llm/                      # LLM configs — `uv run -m src.eval.cli list-models`
+  browser/                  # headless.yaml, headed.yaml, stealth.yaml
+  prompt/                   # default.yaml, concise.yaml
+  judge/                    # Cart eval judge configs
+  experiment/               # Preset experiment configs
+agent_docs/modal.md         # Modal deployment guidelines
+config.toml                 # Config for browser agent
+.github/workflows/          # CI/CD: auto-deploy on push to main (path-filtered)
 ```
 
-## Entry Points
-
-| Command | Purpose |
-|---------|---------|
-| `uv run -m src.local.cli login` | Save browser profile |
-| `uv run -m src.local.cli shop` | Local shopping |
-| `uv run -m src.eval.cli` | Run evaluation harness |
-| `uv run modal deploy browser-use-app/app.py` | Deploy to Modal |
-
-## Quick Start
-
-ALWAYS use `uv` to run python scripts.
+## Commands
 
 ```bash
 # Setup
 uv sync && uvx playwright install chromium --with-deps --no-shell
 
-# Login and shop locally
-uv run -m src.local.cli login
-uv run -m src.local.cli shop
-
-# Run eval
-uv run -m src.eval.cli llm=llama_70b 'items=[bread,milk]'
-```
-
-## Environment Variables
-
-See `.env.example` or set:
-- `GROQ_API_KEY` - Required for Groq models
-- `OPENROUTER_API_KEY` - Required for OpenRouter models
-- `SUPERSTORE_USER`, `SUPERSTORE_PASSWORD` - For login
-
-## Key Files
-
-| Area | Files |
-|------|-------|
-| Browser setup | [src/core/browser.py](src/core/browser.py) |
-| Eval harness | [src/eval/harness.py](src/eval/harness.py), [src/eval/config.py](src/eval/config.py) |
-| Cart verification | [src/eval/cart_checker.py](src/eval/cart_checker.py) |
-| Hydra config | [conf/config.yaml](conf/config.yaml) |
-| LLM configs | [conf/llm/](conf/llm/) - see `uv run -m src.eval.cli list-models` |
-| Judge configs | [conf/judge/](conf/judge/) |
-| Modal docs | [agent_docs/modal.md](agent_docs/modal.md) |
-| Prompts | [src/prompts/](src/prompts/) |
-
-## Evaluation CLI
-
-```bash
-uv run -m src.eval.cli                           # Default config
-uv run -m src.eval.cli llm=llama_70b             # Override LLM
-uv run -m src.eval.cli browser=headed            # Visible browser
-uv run -m src.eval.cli --multirun llm=gpt41,llama_70b  # Compare models (sequential)
-uv run -m src.eval.cli --multirun hydra/launcher=joblib llm=gpt41,llama_70b  # Compare models (parallel)
-uv run -m src.eval.cli list-models               # Available LLMs
-uv run -m src.eval.cli list-runs                 # Recent runs
-uv run -m src.eval.cli --help                    # Full options
-```
-
-## Modal Deployment
-
-See [agent_docs/modal.md](agent_docs/modal.md) for detailed guidelines.
-
-```bash
-uv run modal deploy browser-use-app/app.py      # Deploy
-uv run modal serve browser-use-app/app.py       # Dev with hot-reload
-uv run modal app logs superstore-agent  # Stream logs
-```
-
-## Voice App
-
-WebRTC voice shopping UI using OpenAI Realtime API with an iridescent WebGL orb.
-
-### Key files
-
-| What | File |
-|------|------|
-| All frontend logic (orb, audio, WebRTC) | `voice-app/public/app.ts` |
-| Markup + CSS | `voice-app/public/index.html` |
-| Backend (FastAPI on Modal) | `voice-app/modal_app.py` |
-
-### Audio → Orb pipeline
-
-1. `startSession` creates `AudioContext` + `AnalyserNode` (fftSize=1024)
-2. `pc.ontrack` connects remote audio stream to analyser via `createMediaStreamSource`
-3. `renderOrbFrame` reads `getByteFrequencyData`, normalizes to 0-1, smooths, and drives shader uniforms (`uAmplitude`, `uSpeed`) + CSS (`scale`, `glowOpacity`)
-
-### Build & deploy
-
-```bash
-cd voice-app && npm run build          # compile app.ts → app.js
+# Voice app
+cd voice-app && npm ci && npm run build
 uv run modal deploy voice-app/modal_app.py
+
+# Browser agent
+uv run modal deploy browser-use-app/app.py
+uv run modal serve browser-use-app/app.py      # Dev with hot-reload
+uv run modal app logs superstore-agent          # Stream logs
+
+# Local CLI (browser agent)
+uv run -m src.local.cli login                   # Save browser profile
+uv run -m src.local.cli shop                    # Interactive shopping
+
+# Eval harness
+uv run -m src.eval.cli                          # Default config
+uv run -m src.eval.cli llm=llama_70b            # Override LLM
+uv run -m src.eval.cli browser=headed           # Visible browser
+uv run -m src.eval.cli --multirun llm=gpt41,llama_70b  # Compare models
+uv run -m src.eval.cli list-models              # Available LLMs
+uv run -m src.eval.cli list-runs                # Recent runs
 ```

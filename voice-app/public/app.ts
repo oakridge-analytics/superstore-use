@@ -374,7 +374,7 @@ function setStatus(s: "connecting" | "listening" | "thinking" | "speaking" | "di
 }
 
 // ─── Inactivity Auto-Shutdown ───
-const INACTIVITY_TIMEOUT_MS = 30_000;
+const INACTIVITY_TIMEOUT_MS = 10_000;
 
 function resetInactivityTimer() {
   if (state.inactivityTimer) clearTimeout(state.inactivityTimer);
