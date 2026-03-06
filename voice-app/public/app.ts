@@ -70,6 +70,8 @@ interface AppState {
   captionTimeout: ReturnType<typeof setTimeout> | null;
   // Inactivity auto-shutdown (30s)
   inactivityTimer: ReturnType<typeof setTimeout> | null;
+  // Max session duration timer
+  sessionTimer: ReturnType<typeof setTimeout> | null;
   // Transcript
   hasTranscriptContent: boolean;
   // Cost tracking
@@ -107,6 +109,8 @@ const state: AppState = {
   captionTimeout: null,
   // Inactivity auto-shutdown
   inactivityTimer: null,
+  // Max session duration
+  sessionTimer: null,
   // Transcript
   hasTranscriptContent: false,
   // Cost tracking
@@ -378,6 +382,10 @@ function setStatus(s: "connecting" | "listening" | "thinking" | "speaking" | "di
   state.currentStatus = s;
 }
 
+// ─── Session Cost & Duration Limits ───
+const MAX_SESSION_DURATION_MS = 15 * 60 * 1_000; // 15 minutes hard limit
+const MAX_SESSION_COST_USD = 2.00; // $2 cost ceiling per session
+
 // ─── Inactivity Auto-Shutdown ───
 const INACTIVITY_TIMEOUT_MS = 10_000;
 
@@ -433,6 +441,13 @@ function updateCostDisplay() {
     ? `$${cost.toFixed(4)}`
     : `$${cost.toFixed(2)}`;
   costToggle.classList.add("visible");
+  // Enforce cost ceiling
+  if (cost >= MAX_SESSION_COST_USD) {
+    console.log(`Session cost $${cost.toFixed(2)} exceeded limit — ending session`);
+    addMessage("system", "Session ended — cost limit reached.");
+    setCaption("Session ended — cost limit reached.", "system");
+    endSession();
+  }
 }
 
 // ─── Live Caption ───
@@ -642,6 +657,13 @@ async function startSession() {
       console.log("Data channel open, WebRTC connected");
       setStatus("listening");
       resetInactivityTimer();
+      // Start max session duration timer
+      state.sessionTimer = setTimeout(() => {
+        console.log("Max session duration reached — ending session");
+        addMessage("system", "Session ended — maximum duration reached.");
+        setCaption("Session ended — maximum duration reached.", "system");
+        endSession();
+      }, MAX_SESSION_DURATION_MS);
       // Prompt the agent to greet the user and explain what it can do
       sendDataChannelMessage({
         type: "conversation.item.create",
@@ -696,6 +718,10 @@ async function startSession() {
 
 function endSession() {
   clearInactivityTimer();
+  if (state.sessionTimer) {
+    clearTimeout(state.sessionTimer);
+    state.sessionTimer = null;
+  }
   // Stop mic
   if (state.localStream) {
     state.localStream.getTracks().forEach((t) => t.stop());
