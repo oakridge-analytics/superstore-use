@@ -297,6 +297,7 @@ function renderOrbFrame(time: number) {
   if (state.awaitingAudioDrain && state.smoothedAudioLevel < 0.005) {
     state.awaitingAudioDrain = false;
     setStatus("listening");
+    resetInactivityTimer();
   }
 
   const level = state.smoothedAudioLevel;
@@ -749,7 +750,7 @@ let currentMsgEl: HTMLElement | null = null;
 function handleServerEvent(event: any) {
   switch (event.type) {
     case "response.audio_transcript.delta":
-      resetInactivityTimer();
+      clearInactivityTimer();
       setStatus("speaking");
       if (!currentMsgEl) {
         state.currentAssistantMsg = "";
@@ -817,8 +818,9 @@ function handleServerEvent(event: any) {
         state.sessionCost += cost;
         updateCostDisplay();
       }
-      if (!currentMsgEl) {
+      if (!currentMsgEl && !state.awaitingAudioDrain) {
         setStatus("listening");
+        resetInactivityTimer();
       }
       break;
 
