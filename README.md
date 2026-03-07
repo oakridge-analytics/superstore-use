@@ -29,17 +29,17 @@ uv run modal deploy voice-app/modal_app.py
 ```
 
 **Required Modal secrets:**
-| Secret | Keys |
-|--------|------|
-| `pc-express-voice-openai` | `OPENAI_API_KEY` |
-| `mapbox-api-key` | `MAPBOX_API_KEY` |
-| `pc-express-voice-app-token` | `VOICE_APP_TOKEN` |
+| Secret | Keys | Note |
+|--------|------|------|
+| `pc-express-voice-openai` | `OPENAI_API_KEY` ||
+| `mapbox-api-key` | `MAPBOX_API_KEY` ||
+| `pc-express-voice-app-token` | `VOICE_APP_TOKEN` | Token for authentication to backend, can be generated as desired |
 
 ## Browser Agent
 
 Chat-based web UI where you type grocery requests and an LLM-driven agent automates a real Chromium browser (via Playwright) to shop on the Superstore website.
 
-**Tech stack:** browser-use + LangGraph + Playwright, deployed on Modal with xvfb for headless rendering
+**Tech stack:** browser-use + LangGraph + Playwright, deployed on Modal with xvfb for headful rendering
 
 ### Deploy
 
