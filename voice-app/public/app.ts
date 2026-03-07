@@ -943,10 +943,13 @@ async function handleToolCall(event: any) {
     showCartLink();
     addMessage("system", "Shopping complete! Review your cart on PC Express.");
     setCaption("Shopping complete!", "system");
-    // End the session after a delay so the agent's farewell audio can finish playing
-    setTimeout(() => {
-      endSession();
-    }, 4000);
+    // Auto-end the session for off-topic shutdowns; normal finishes stay open
+    // so the user can review their cart link at their own pace.
+    if (args.reason === "off_topic") {
+      setTimeout(() => {
+        endSession();
+      }, 4000);
+    }
   }
 
   // Strip cart_url so the voice agent never sees raw URLs to read aloud.
