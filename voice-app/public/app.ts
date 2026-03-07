@@ -941,12 +941,12 @@ async function handleToolCall(event: any) {
       a.href = result.cart_url;
     }
     showCartLink();
-    const cartAnchor = document.getElementById("cart-link-a") as HTMLAnchorElement;
-    cartAnchor.addEventListener("click", () => {
-      endSession();
-    }, { once: true });
     addMessage("system", "Shopping complete! Review your cart on PC Express.");
     setCaption("Shopping complete!", "system");
+    // End the session after a delay so the agent's farewell audio can finish playing
+    setTimeout(() => {
+      endSession();
+    }, 4000);
   }
 
   // Strip cart_url so the voice agent never sees raw URLs to read aloud.
