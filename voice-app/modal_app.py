@@ -8,6 +8,8 @@ image = (
 
 app = modal.App("pc-express-voice")
 
+usage_stats = modal.Dict.from_name("voice-usage-stats", create_if_missing=True)
+
 PCX_BASE = "https://api.pcexpress.ca/pcx-bff/api/v1"
 PCX_BASE_HEADERS = {
     "x-apikey": "C1xujSegT5j3ap3yexJjqhOfELwGKYvz",
@@ -211,6 +213,7 @@ TOOLS = [
 
 
 def create_web_app():
+    import hashlib
     import json
     import math
     import os
@@ -227,10 +230,25 @@ def create_web_app():
 
     web_app = FastAPI()
 
+    def _hash_ip(ip: str) -> str:
+        """One-way hash so we can count unique users without storing raw IPs."""
+        return hashlib.sha256(ip.encode()).hexdigest()[:12]
+
     def _log(event: str, **kw):
+        if "ip" in kw:
+            kw["ip"] = _hash_ip(str(kw["ip"]))
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         parts = " ".join(f"{k}={v}" for k, v in kw.items())
         print(f"[{ts}] [{event}] {parts}")
+
+    def _inc(counter: str, amount: int = 1):
+        """Increment a persistent usage counter (keyed by date + event)."""
+        date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"{date_key}:{counter}"
+        try:
+            usage_stats[key] = usage_stats.get(key, 0) + amount
+        except Exception:
+            pass  # Never let stats tracking break the app
 
     class NoCacheMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -278,6 +296,7 @@ def create_web_app():
         session_id = uuid.uuid4().hex[:12]
         user_agent = request.headers.get("user-agent", "")[:100]
         _log("session_start", session_id=session_id, ip=ip, ua=f'"{user_agent}"')
+        _inc("sessions")
 
         api_key = os.environ["OPENAI_API_KEY"]
         async with httpx.AsyncClient() as client:
@@ -305,15 +324,35 @@ def create_web_app():
                     "input_audio_noise_reduction": {
                         "type": "near_field",
                     },
-                    "tracing": {
-                        "workflow_name": "pc-express-voice",
-                        "group_id": session_id,
-                    },
                 },
             )
         data = resp.json()
         _log("session_ready", session_id=session_id, model=data.get("model", "?"))
         return data
+
+    @web_app.get("/api/stats")
+    async def get_stats(request: Request):
+        """Return usage counters for the last 30 days. Requires the same auth token."""
+        expected = os.environ.get("VOICE_APP_TOKEN", "")
+        auth = request.headers.get("Authorization", "")
+        if not expected or not auth.startswith("Bearer ") or auth[7:] != expected:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+        from datetime import timedelta
+
+        counters = ["sessions", "store_lookups", "searches", "items_added", "completed_sessions"]
+        today = datetime.now(timezone.utc).date()
+        results = {}
+        for day_offset in range(30):
+            date_str = (today - timedelta(days=day_offset)).isoformat()
+            day_data = {}
+            for counter in counters:
+                val = usage_stats.get(f"{date_str}:{counter}", 0)
+                if val:
+                    day_data[counter] = val
+            if day_data:
+                results[date_str] = day_data
+        return results
 
     @web_app.post("/api/find-stores")
     async def find_stores(request: Request):
@@ -322,6 +361,7 @@ def create_web_app():
         body = await request.json()
         query = body.get("location") or body.get("postal_code") or ""
         _log("find_stores", query=f'"{query}"')
+        _inc("store_lookups")
 
         # Canadian postal code: A1A 1A1 (letter-digit-letter space? digit-letter-digit)
         CA_POSTAL_RE = re.compile(r"^([A-Za-z]\d[A-Za-z])\s*(\d[A-Za-z]\d)$")
@@ -470,6 +510,7 @@ def create_web_app():
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
         _log("search", term=f'"{term}"', store_id=store_id, banner=banner)
+        _inc("searches")
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{PCX_BASE}/products/search",
@@ -536,6 +577,7 @@ def create_web_app():
         items = body.get("items", [])
 
         _log("add_to_cart", items=len(items), cart_id=cart_id, store_id=store_id, banner=banner)
+        _inc("items_added", len(items))
         for item in items:
             print(f"[add-to-cart]   {item['product_code']} x{item['quantity']}")
 
@@ -680,6 +722,7 @@ def create_web_app():
         base_url = BANNERS.get(banner, BANNERS["superstore"])["cart_url"]
         cart_url = f"{base_url}?forceCartId={cart_id}" if cart_id else None
         _log("finish_shopping", cart_id=cart_id, banner=banner)
+        _inc("completed_sessions")
         return {"success": True, "message": "Shopping session complete", "cart_url": cart_url}
 
     @web_app.get("/")
