@@ -6,7 +6,7 @@ image = (
     .add_local_dir("./voice-app/public", remote_path="/app/public")
 )
 
-app = modal.App("pc-express-voice")
+app = modal.App("voice-shopping")
 
 usage_stats = modal.Dict.from_name("voice-usage-stats", create_if_missing=True)
 
@@ -395,7 +395,9 @@ def create_web_app():
                     headers=pcx_headers(banner),
                 )
                 if resp.status_code != 200 or not resp.text.strip():
-                    print(f"[find-stores] {banner}: HTTP {resp.status_code}, empty={not resp.text.strip()}, body={resp.text[:200]}")
+                    print(
+                        f"[find-stores] {banner}: HTTP {resp.status_code}, empty={not resp.text.strip()}, body={resp.text[:200]}"
+                    )
                     return []
                 data = resp.json()
                 locs = data if isinstance(data, list) else data.get("pickupLocations", [])
@@ -742,5 +744,5 @@ def create_web_app():
 )
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app()
-def serve():
+def ui():
     return create_web_app()

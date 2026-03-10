@@ -1074,6 +1074,10 @@ async function handleToolCall(event: any) {
   }
 
   if (name === "finish_shopping") {
+    // Mute mic immediately so the goodbye message plays uninterrupted.
+    if (state.localStream) {
+      state.localStream.getTracks().forEach(t => t.enabled = false);
+    }
     if (result.cart_url) {
       const a = document.getElementById("cart-link-a") as HTMLAnchorElement;
       a.href = result.cart_url;
@@ -1081,13 +1085,11 @@ async function handleToolCall(event: any) {
     showCartLink();
     addMessage("system", "Shopping complete! Review your cart.");
     setCaption("Shopping complete!", "system");
-    // Auto-end the session for off-topic shutdowns; normal finishes stay open
-    // so the user can review their cart link at their own pace.
-    if (args.reason === "off_topic") {
-      setTimeout(() => {
-        endSession();
-      }, 4000);
-    }
+    // Auto-end the session after the goodbye message finishes.
+    const delay = args.reason === "off_topic" ? 4000 : 8000;
+    setTimeout(() => {
+      endSession();
+    }, delay);
   }
 
   // Strip cart_url so the voice agent never sees raw URLs to read aloud.
