@@ -394,6 +394,9 @@ def create_web_app():
                     f"{PCX_BASE}/pickup-locations?bannerIds={banner}",
                     headers=pcx_headers(banner),
                 )
+                if resp.status_code != 200 or not resp.text.strip():
+                    print(f"[find-stores] {banner}: HTTP {resp.status_code}, empty={not resp.text.strip()}, body={resp.text[:200]}")
+                    return []
                 data = resp.json()
                 locs = data if isinstance(data, list) else data.get("pickupLocations", [])
                 print(f"[find-stores] {banner}: {len(locs)} locations")

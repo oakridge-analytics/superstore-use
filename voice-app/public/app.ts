@@ -10,17 +10,17 @@ const REALTIME_URL = `https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}
 // gpt-realtime-mini pricing (USD per token)
 // https://openai.com/api/pricing/
 const PRICING = {
-  textInput:   0.60  / 1_000_000,
-  textCached:  0.30  / 1_000_000,
-  textOutput:  2.40  / 1_000_000,
-  audioInput:  10.00 / 1_000_000,
-  audioCached: 0.30  / 1_000_000,
+  textInput: 0.60 / 1_000_000,
+  textCached: 0.30 / 1_000_000,
+  textOutput: 2.40 / 1_000_000,
+  audioInput: 10.00 / 1_000_000,
+  audioCached: 0.30 / 1_000_000,
   audioOutput: 20.00 / 1_000_000,
 };
 
 // Orb colors — two states only
 const STATE_COLORS: Record<string, number[]> = {
-  active:       [0.29, 0.56, 0.96],  // blue
+  active: [0.29, 0.56, 0.96],  // blue
   disconnected: [0.35, 0.38, 0.50],  // muted gray
 };
 
@@ -37,6 +37,7 @@ interface OrbGL {
   uResolution: WebGLUniformLocation | null;
   uAmplitude: WebGLUniformLocation | null;
   uSpeed: WebGLUniformLocation | null;
+  uBreath: WebGLUniformLocation | null;
 }
 
 interface AppState {
@@ -66,6 +67,7 @@ interface AppState {
   orbGL: OrbGL | null;
   spinAngle: number;
   spinSpeed: number;
+  breathMix: number;
   // Caption
   captionTimeout: ReturnType<typeof setTimeout> | null;
   // Inactivity auto-shutdown (30s)
@@ -105,6 +107,7 @@ const state: AppState = {
   orbGL: null,
   spinAngle: 0,
   spinSpeed: 0,
+  breathMix: 1,
   // Caption
   captionTimeout: null,
   // Inactivity auto-shutdown
@@ -163,41 +166,168 @@ uniform vec3 uColor;
 uniform vec3 uResolution;
 uniform float uAmplitude;
 uniform float uSpeed;
+uniform float uBreath;
 varying vec2 vUv;
 
-float noise(vec2 p) {
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+// --- Simplex-style gradient noise (2D) ---
+vec3 mod289(vec3 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
+vec2 mod289v2(vec2 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
+vec3 permute(vec3 x) { return mod289((x * 34.0 + 1.0) * x); }
+
+float snoise(vec2 v) {
+  const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                      -0.577350269189626, 0.024390243902439);
+  vec2 i  = floor(v + dot(v, C.yy));
+  vec2 x0 = v - i + dot(i, C.xx);
+  vec2 i1 = (x0.x > x0.y) ? vec2(1.0,0.0) : vec2(0.0,1.0);
+  vec4 x12 = x0.xyxy + C.xxzz;
+  x12.xy -= i1;
+  i = mod289v2(i);
+  vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0))
+                            + i.x + vec3(0.0, i1.x, 1.0));
+  vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy),
+                           dot(x12.zw,x12.zw)), 0.0);
+  m = m * m; m = m * m;
+  vec3 x_ = 2.0 * fract(p * C.www) - 1.0;
+  vec3 h  = abs(x_) - 0.5;
+  vec3 ox = floor(x_ + 0.5);
+  vec3 a0 = x_ - ox;
+  m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+  vec3 g;
+  g.x = a0.x * x0.x   + h.x * x0.y;
+  g.y = a0.y * x12.x  + h.y * x12.y;
+  g.z = a0.z * x12.z  + h.z * x12.w;
+  return 130.0 * dot(m, g);
 }
 
-float smoothNoise(vec2 p) {
-  vec2 i = floor(p); vec2 f = fract(p);
-  f = f * f * (3.0 - 2.0 * f);
-  float a = noise(i), b = noise(i + vec2(1,0));
-  float c = noise(i + vec2(0,1)), d = noise(i + vec2(1,1));
-  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+// --- 3D simplex noise (time-varying surfaces) ---
+vec4 mod289v4(vec4 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 permute4(vec4 x) { return mod289v4((x * 34.0 + 1.0) * x); }
+vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+float snoise3(vec3 v) {
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g2 = step(x0.yzx, x0.xyz);
+  vec3 g3 = 1.0 - g2;
+  vec3 i1 = min(g2, g3.zxy);
+  vec3 i2 = max(g2, g3.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - 0.5;
+  i = mod289(i);
+  vec4 p = permute4(permute4(permute4(
+    i.z + vec4(0.0, i1.z, i2.z, 1.0))
+  + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+  + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  vec4 j = p - 49.0 * floor(p * (1.0/49.0));
+  vec4 x_ = floor(j * (1.0/7.0));
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 xx = (x_ * 2.0 + 0.5) / 7.0 - 1.0;
+  vec4 yy = (y_ * 2.0 + 0.5) / 7.0 - 1.0;
+  vec4 h  = 1.0 - abs(xx) - abs(yy);
+  vec4 b0 = vec4(xx.xy, yy.xy);
+  vec4 b1 = vec4(xx.zw, yy.zw);
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+  vec3 g0 = vec3(a0.xy, h.x);
+  vec3 g1 = vec3(a0.zw, h.y);
+  vec3 gg2 = vec3(a1.xy, h.z);
+  vec3 gg3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(g0,g0),dot(g1,g1),dot(gg2,gg2),dot(gg3,gg3)));
+  g0 *= norm.x; g1 *= norm.y; gg2 *= norm.z; gg3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)), 0.0);
+  m = m * m; m = m * m;
+  return 42.0 * dot(m, vec4(dot(g0,x0),dot(g1,x1),dot(gg2,x2),dot(gg3,x3)));
 }
 
-float fbm(vec2 p) {
-  return smoothNoise(p*2.0)*0.5 + smoothNoise(p*4.0+1.3)*0.25 + smoothNoise(p*8.0+2.7)*0.125;
+// --- FBM: 2 octaves, low frequency — very smooth, blobby ---
+float fbm(vec3 p) {
+  return snoise3(p) * 0.6 + snoise3(p * 1.5 + vec3(100.0, 100.0, 0.0)) * 0.3;
+}
+
+// --- 2D FBM for domain warping — very smooth ---
+float fbm2(vec2 p) {
+  return snoise(p) * 0.6 + snoise(p * 1.5 + vec2(100.0)) * 0.3;
 }
 
 void main() {
   float mr = min(uResolution.x, uResolution.y);
   vec2 uv = (vUv * 2.0 - 1.0) * uResolution.xy / mr;
   float dist = length(uv);
-  float mask = smoothstep(1.0, 0.7, dist);
 
-  // Polar rotation — uSpeed is the accumulated angle (radians).
-  // Rotates the noise pattern smoothly in one direction.
+  // Soft organic edge mask
+  float mask = smoothstep(1.02, 0.65, dist);
+
+  // Breathing: slow ambient pulse on scale + brightness
+  float breath = uBreath;
+
+  // Polar rotation with accumulated angle
   float angle = atan(uv.y, uv.x) + uSpeed;
   vec2 rotUv = vec2(dist * cos(angle), dist * sin(angle));
-  float n = fbm(rotUv * (1.5 + uAmplitude * 1.5));
 
-  vec3 col = mix(uColor, uColor * vec3(0.7, 1.1, 1.3), n) * (0.5 + n * 0.8 + uAmplitude * 0.5);
+  // === Domain warping: feed FBM into itself for swirling plasma ===
+  float t = uTime * 0.12;
+  float warpStrength = 0.6 + uAmplitude * 1.2;
 
-  // Fresnel rim
-  float rim = pow(smoothstep(0.3, 0.95, dist), 3.0) * smoothstep(1.1, 0.95, dist);
-  col += uColor * rim * (0.2 + uAmplitude * 0.6);
+  // First warp pass
+  float w1 = fbm(vec3(rotUv * 1.0, t));
+  float w2 = fbm(vec3(rotUv * 1.0 + vec2(5.2, 1.3), t * 0.8));
+  vec2 warpedUv = rotUv + vec2(w1, w2) * warpStrength;
+
+  // Second warp pass (feeds first warp output back in)
+  float w3 = fbm(vec3(warpedUv * 0.8, t * 1.1));
+  float w4 = fbm(vec3(warpedUv * 0.8 + vec2(1.7, 9.2), t * 0.9));
+  warpedUv = rotUv + vec2(w3, w4) * warpStrength * 0.8;
+
+  // Main noise value from the warped coordinates
+  float n = fbm(vec3(warpedUv * (0.8 + uAmplitude * 1.0), t * 1.3));
+  n = n * 0.5 + 0.5; // remap to 0..1
+
+  // === Multi-layer color mixing ===
+  // Warm highlight (shifts toward white/cyan at peaks)
+  vec3 highlight = vec3(0.85, 0.95, 1.0);
+  // Cool shadow (deeper, more saturated version of base color)
+  vec3 shadow = uColor * vec3(0.3, 0.4, 0.7);
+  // Subsurface warm glow
+  vec3 subsurface = uColor * vec3(1.3, 0.8, 0.6);
+
+  // Mix layers based on noise + a secondary noise for variation
+  float n2 = fbm2(warpedUv * 2.0 + t * 0.5);
+  n2 = n2 * 0.5 + 0.5;
+
+  vec3 col = mix(shadow, uColor, smoothstep(0.2, 0.6, n));
+  col = mix(col, subsurface, smoothstep(0.5, 0.8, n2) * 0.4);
+  col = mix(col, highlight, smoothstep(0.7, 0.95, n) * (0.3 + uAmplitude * 0.5));
+
+  // Overall brightness with breathing and amplitude
+  float brightness = 0.55 + n * 0.6 + uAmplitude * 0.4 + breath * 0.15;
+  col *= brightness;
+
+  // === Fresnel rim with chromatic fringing ===
+  float rimBase = pow(smoothstep(0.3, 0.92, dist), 2.5) * smoothstep(1.05, 0.92, dist);
+  float rimIntensity = 0.25 + uAmplitude * 0.6 + breath * 0.1;
+
+  // Chromatic aberration: offset R, G, B channels at the rim
+  float chromaOffset = 0.015 + uAmplitude * 0.01;
+  vec2 uvR = (vUv * 2.0 - 1.0) * (1.0 + chromaOffset) * uResolution.xy / mr;
+  vec2 uvB = (vUv * 2.0 - 1.0) * (1.0 - chromaOffset) * uResolution.xy / mr;
+  float distR = length(uvR);
+  float distB = length(uvB);
+  float rimR = pow(smoothstep(0.3, 0.92, distR), 2.5) * smoothstep(1.05, 0.92, distR);
+  float rimB = pow(smoothstep(0.3, 0.92, distB), 2.5) * smoothstep(1.05, 0.92, distB);
+
+  col.r += uColor.r * rimR * rimIntensity * 1.2;
+  col.g += uColor.g * rimBase * rimIntensity;
+  col.b += uColor.b * rimB * rimIntensity * 1.3;
+
+  // Inner glow — simulates subsurface scattering near center
+  float innerGlow = smoothstep(0.6, 0.0, dist) * (0.08 + uAmplitude * 0.12 + breath * 0.06);
+  col += highlight * innerGlow;
 
   gl_FragColor = vec4(col * mask, 1.0);
 }`;
@@ -263,6 +393,7 @@ function initOrbGL() {
     uResolution: gl.getUniformLocation(program, "uResolution"),
     uAmplitude: gl.getUniformLocation(program, "uAmplitude"),
     uSpeed: gl.getUniformLocation(program, "uSpeed"),
+    uBreath: gl.getUniformLocation(program, "uBreath"),
   };
 
   resizeOrbCanvas();
@@ -316,9 +447,15 @@ function renderOrbFrame(time: number) {
   // Audio-reactive amplitude (drives FBM detail + rim brightness)
   const amplitude = 0.05 + level * 0.25;
 
+  // Idle breathing — slow sine pulse that fades out when audio is active
+  const breathTarget = level > 0.02 ? 0 : 1;
+  state.breathMix += (breathTarget - state.breathMix) * 0.01;
+  const breath = Math.sin(time * 0.0008) * 0.5 + 0.5; // 0..1 slow pulse
+  const breathValue = breath * state.breathMix;
+
   // Smooth continuous rotation — driven purely by audio level
   const hasAudio = level > 0.01;
-  const targetSpinSpeed = hasAudio ? 0.3 + level * 0.5 : 0.03; // radians/sec
+  const targetSpinSpeed = hasAudio ? 0.3 + level * 0.5 : 0.05; // slightly faster idle spin
   state.spinSpeed += (targetSpinSpeed - state.spinSpeed) * 0.02;
   state.spinAngle = (state.spinAngle + state.spinSpeed / 60) % (Math.PI * 200);
 
@@ -339,6 +476,7 @@ function renderOrbFrame(time: number) {
   gl.uniform3f(o.uResolution, gl.canvas.width, gl.canvas.height, gl.canvas.width / gl.canvas.height);
   gl.uniform1f(o.uAmplitude, amplitude);
   gl.uniform1f(o.uSpeed, state.spinAngle);
+  gl.uniform1f(o.uBreath, breathValue);
 
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -355,8 +493,8 @@ function renderOrbFrame(time: number) {
   orbGlow.style.filter = `blur(${blurSize}px)`;
   orbClip.style.boxShadow = `0 0 ${60 + level * 160}px rgba(${r}, ${g}, ${b}, ${0.15 + level * 0.6})`;
 
-  // Subtle breathing scale — shader handles all rotation
-  const scale = 1 + level * 0.12;
+  // Scale: audio-reactive + idle breathing
+  const scale = 1 + level * 0.12 + breathValue * 0.03;
   orbClip.style.transform = `scale(${scale})`;
 
   state.orbAnimId = requestAnimationFrame(renderOrbFrame);
@@ -414,20 +552,20 @@ function calculateUsageCost(usage: any): number {
   const out = usage.output_token_details || {};
   const cached = inp.cached_tokens_details || {};
 
-  const textIn   = (inp.text_tokens  || 0) - (cached.text_tokens  || 0);
-  const textCach = cached.text_tokens  || 0;
-  const audioIn  = (inp.audio_tokens || 0) - (cached.audio_tokens || 0);
+  const textIn = (inp.text_tokens || 0) - (cached.text_tokens || 0);
+  const textCach = cached.text_tokens || 0;
+  const audioIn = (inp.audio_tokens || 0) - (cached.audio_tokens || 0);
   const audioCach = cached.audio_tokens || 0;
-  const textOut  = out.text_tokens  || 0;
+  const textOut = out.text_tokens || 0;
   const audioOut = out.audio_tokens || 0;
 
   return (
-    textIn    * PRICING.textInput  +
-    textCach  * PRICING.textCached +
-    audioIn   * PRICING.audioInput +
+    textIn * PRICING.textInput +
+    textCach * PRICING.textCached +
+    audioIn * PRICING.audioInput +
     audioCach * PRICING.audioCached +
-    textOut   * PRICING.textOutput +
-    audioOut  * PRICING.audioOutput
+    textOut * PRICING.textOutput +
+    audioOut * PRICING.audioOutput
   );
 }
 
