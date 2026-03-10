@@ -1086,7 +1086,7 @@ async function handleToolCall(event: any) {
     addMessage("system", "Shopping complete! Review your cart.");
     setCaption("Shopping complete!", "system");
     // Auto-end the session after the goodbye message finishes.
-    const delay = args.reason === "off_topic" ? 4000 : 8000;
+    const delay = args.reason === "off_topic" ? 8000 : 8000;
     setTimeout(() => {
       endSession();
     }, delay);
