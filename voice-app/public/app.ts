@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// PC Express Voice — app.ts
+// Voice Shopping Assistant — app.ts
 // Voice-reactive soft glow orb + live caption + always-visible transcript
 // ═══════════════════════════════════════════════════════════════
 
@@ -553,7 +553,7 @@ function removeCartItem(productCode: string) {
 function showCartLink() {
   if (state.cart_id) {
     const a = document.getElementById("cart-link-a") as HTMLAnchorElement;
-    const baseUrl = state.cart_url || "https://www.realcanadiansuperstore.ca/en/cartReview";
+    const baseUrl = state.cart_url || "/cart";
     a.href = `${baseUrl}?forceCartId=${state.cart_id}`;
   }
   cartLink.style.display = "block";
@@ -670,7 +670,7 @@ async function startSession() {
         item: {
           type: "message",
           role: "system",
-          content: [{ type: "input_text", text: "Greet the user warmly. Briefly tell them you can help come up with recipe ideas and manage their cart on PC Express. Then ask where they're located so you can find the nearest store." }],
+          content: [{ type: "input_text", text: "Greet the user warmly. Briefly tell them you can help come up with recipe ideas and manage their grocery cart. Then ask where they're located so you can find the nearest store." }],
         },
       });
       sendDataChannelMessage({ type: "response.create" });
@@ -941,7 +941,7 @@ async function handleToolCall(event: any) {
       a.href = result.cart_url;
     }
     showCartLink();
-    addMessage("system", "Shopping complete! Review your cart on PC Express.");
+    addMessage("system", "Shopping complete! Review your cart.");
     setCaption("Shopping complete!", "system");
     // Auto-end the session for off-topic shutdowns; normal finishes stay open
     // so the user can review their cart link at their own pace.
