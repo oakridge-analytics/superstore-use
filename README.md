@@ -2,7 +2,7 @@
 
 Speed up your PC Express grocery shopping with an llm voice agent.
 
-https://dbandrews--pc-express-voice-serve.modal.run/
+https://dbandrews--voice-shopping-ui.modal.run/
 
 Two ways to shop:
 
