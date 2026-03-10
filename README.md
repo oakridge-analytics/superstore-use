@@ -7,7 +7,7 @@ https://dbandrews--voice-shopping-ui.modal.run/
 Two ways to shop:
 
 - **Voice App** — Talk to an AI assistant that searches products, adds to cart, and suggests recipes via voice. Uses OpenAI Realtime API with WebRTC.
-- **Browser Agent** — Type grocery requests into a chat UI and an LLM agent automates browsers in parallel to navigate the store website and add items to your cart. Robust to PC ExpressAPI changes. Done as a technical learning exercise.
+- **Browser Agent** —  *Deprecated* Type grocery requests into a chat UI and an LLM agent automates browsers in parallel to navigate the store website and add items to your cart. Robust to PC Express API changes. Done as a technical learning exercise, but difficult to maintain correct authentication.
 
 ## Voice App
 
@@ -35,11 +35,13 @@ uv run modal deploy voice-app/modal_app.py
 | `mapbox-api-key` | `MAPBOX_API_KEY` ||
 | `pc-express-voice-app-token` | `VOICE_APP_TOKEN` | Token for authentication to backend, can be generated as desired |
 
-## Browser Agent
+## Browser Agent *(Deprecated)*
 
-Chat-based web UI where you type grocery requests and an LLM-driven agent automates a real Chromium browser (via Playwright) to shop on the Superstore website.
+Chat-based web UI where you type grocery requests and a browser-use agent shops on the Superstore website.
 
-**Tech stack:** browser-use + LangGraph + Playwright, deployed on Modal with xvfb for headful rendering
+This approach was done initially to avoid using the PC Express API directly, but it was difficult to handle auth and is much slower. More flexible longer term if the PC Express API changes as it just requires prompting the agent to shop.
+
+**Tech stack:** browser-use + LangGraph, deployed on Modal with xvfb for headful rendering
 
 ### Deploy
 
@@ -71,12 +73,13 @@ browser-use-app/
   app.py                # Browser agent (Modal + LangGraph)
   templates/            # Chat web UI
   static/               # CSS & JavaScript
-src/
+src/                    # Common code for browser-use agent
   core/                 # Shared utilities (browser, config, agent)
   local/                # Local CLI (login, shop)
   eval/                 # Evaluation harness
   prompts/              # AI prompt templates
 conf/                   # Hydra configs for evals (llm/, browser/, prompt/, judge/)
+notebooks/              # Rough analysis of evaluation results
 ```
 
 ## Local Development
