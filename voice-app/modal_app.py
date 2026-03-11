@@ -742,7 +742,6 @@ def create_web_app():
     cpu=0.25,
     memory=256,
 )
-@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def ui():
     return create_web_app()
