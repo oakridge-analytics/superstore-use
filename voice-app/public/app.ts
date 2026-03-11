@@ -591,7 +591,13 @@ function updateCostDisplay() {
 // ─── Live Caption ───
 function setCaption(text: string, role = "assistant") {
   // Show beginning of text, truncate at 350 characters
-  liveCaption.textContent = text.length > 350 ? text.slice(0, 350) + "…" : text;
+  const display = text.length > 350 ? text.slice(0, 350) + "…" : text;
+  if (role === "system") {
+    const escaped = display.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    liveCaption.innerHTML = `<span class="caption-spinner"></span>${escaped}`;
+  } else {
+    liveCaption.textContent = display;
+  }
   liveCaption.className = "visible role-" + role;
   // Show beginning of text, not the end
   liveCaption.scrollTop = 0;
@@ -1011,8 +1017,9 @@ async function handleToolCall(event: any) {
 
   console.log(`Tool call: ${name}(${argsStr})`);
   const label = name.replace(/_/g, " ");
-  addMessage("system", `Looking up: ${label}...`);
-  setCaption(`Looking up: ${label}...`, "system");
+  const capLabel = label.charAt(0).toUpperCase() + label.slice(1);
+  addMessage("system", `${capLabel}...`);
+  setCaption(`${capLabel}...`, "system");
 
   // Auto-create cart if a store_id is available but no cart exists yet
   const needsCart = ["search_products", "add_to_cart", "remove_from_cart"].includes(name);

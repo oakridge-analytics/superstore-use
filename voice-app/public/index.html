@@ -242,8 +242,20 @@
     #live-caption::-webkit-scrollbar-track { background: transparent; }
     #live-caption::-webkit-scrollbar-thumb { background: rgba(42,60,130,0.3); border-radius: 3px; }
     #live-caption.visible { opacity: 1; }
-    #live-caption.role-user { color: #a0b8e8; font-style: italic; }
-    #live-caption.role-system { color: var(--text-muted); font-size: 12px; letter-spacing: 0.2px; }
+    #live-caption.role-user, #live-caption.role-assistant { visibility: hidden; }
+    #live-caption.role-system { color: var(--text-muted); font-size: 12px; letter-spacing: 0.2px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+
+    @keyframes caption-spin { to { transform: rotate(360deg); } }
+    .caption-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--text-muted);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: caption-spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
 
     /* ─── Cart Section ─── */
     #cart-section {
@@ -256,7 +268,7 @@
       padding: 20px;
       animation: fade-up 0.3s ease-out;
     }
-    #cart-section.active { display: block; }
+    #cart-section.active { display: block; margin-top: 24px; }
     #cart-section h3 {
       font-size: 11px; font-weight: 600; margin-bottom: 14px;
       color: var(--text-muted); text-transform: uppercase; letter-spacing: 1.5px;
@@ -332,7 +344,7 @@
       font-size: 12px; font-weight: 500; font-family: inherit; letter-spacing: 0.4px;
       transition: all 0.2s;
     }
-    #transcript-toggle.visible { display: flex; }
+    #transcript-toggle.visible { display: flex; margin-top: 24px; }
     #transcript-toggle:hover { color: var(--text-secondary); border-color: var(--border-subtle); background: rgba(15,15,35,0.3); }
     #transcript-toggle .chevron { transition: transform 0.3s ease; width: 14px; height: 14px; }
     #transcript-toggle.expanded .chevron { transform: rotate(180deg); }
