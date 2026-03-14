@@ -525,7 +525,7 @@ const MAX_SESSION_DURATION_MS = 15 * 60 * 1_000; // 15 minutes hard limit
 const MAX_SESSION_COST_USD = 2.00; // $2 cost ceiling per session
 
 // ─── Inactivity Auto-Shutdown ───
-const INACTIVITY_TIMEOUT_MS = 10_000;
+const INACTIVITY_TIMEOUT_MS = 30_000;
 
 function resetInactivityTimer() {
   if (state.inactivityTimer) clearTimeout(state.inactivityTimer);
@@ -943,9 +943,13 @@ function handleServerEvent(event: any) {
       break;
 
     case "input_audio_buffer.speech_started":
-      resetInactivityTimer();
+      clearInactivityTimer();
       state.awaitingAudioDrain = false;
       clearCaption();
+      break;
+
+    case "input_audio_buffer.speech_stopped":
+      resetInactivityTimer();
       break;
 
     case "conversation.item.input_audio_transcription.completed":
@@ -968,7 +972,7 @@ function handleServerEvent(event: any) {
       break;
 
     case "response.function_call_arguments.done":
-      resetInactivityTimer();
+      clearInactivityTimer();
       state.awaitingAudioDrain = false;
       setStatus("thinking");
       handleToolCall(event);
