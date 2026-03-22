@@ -4,18 +4,18 @@
 // ═══════════════════════════════════════════════════════════════
 
 // ─── Constants ───
-const REALTIME_MODEL = "gpt-realtime-mini";
+const REALTIME_MODEL = "gpt-realtime";
 const REALTIME_URL = `https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
 
-// gpt-realtime-mini pricing (USD per token)
+// gpt-realtime pricing (USD per token)
 // https://openai.com/api/pricing/
 const PRICING = {
-  textInput: 0.60 / 1_000_000,
-  textCached: 0.30 / 1_000_000,
-  textOutput: 2.40 / 1_000_000,
-  audioInput: 10.00 / 1_000_000,
-  audioCached: 0.30 / 1_000_000,
-  audioOutput: 20.00 / 1_000_000,
+  textInput: 4.00 / 1_000_000,
+  textCached: 0.40 / 1_000_000,
+  textOutput: 16.00 / 1_000_000,
+  audioInput: 32.00 / 1_000_000,
+  audioCached: 0.40 / 1_000_000,
+  audioOutput: 64.00 / 1_000_000,
 };
 
 // Orb colors — two states only

@@ -286,7 +286,7 @@ def create_web_app():
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "gpt-realtime-mini",
+                    "model": "gpt-realtime",
                     "voice": "cedar",
                     "instructions": SYSTEM_PROMPT,
                     "tools": TOOLS,
