@@ -175,11 +175,12 @@ def create_mcp():
     import math
     import os
     import re
+    from typing import Annotated, Literal, Union
     from urllib.parse import quote
 
     import httpx
     from fastmcp import FastMCP
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
 
     mcp = FastMCP(
         "Superstore Shopping",
@@ -189,7 +190,10 @@ def create_mcp():
             "2. Call superstore_find_nearest_stores to get nearby pickup locations.\n"
             "3. Present the stores and let the user pick one.\n"
             "4. Call superstore_create_cart with the chosen store_id and banner.\n"
-            "5. For each item the user wants, call superstore_search_products, then superstore_add_to_cart.\n"
+            "5. For each item, call superstore_search_products. Each result has a\n"
+            "   'sold_by' field: 'each' (packaged — order with count) or 'weight'\n"
+            "   (bulk produce — order in kg). Call superstore_add_to_cart with items\n"
+            "   whose shape matches: count for 'each', kg for 'weight'.\n"
             "6. Share the cart_url so the user can review and checkout."
         ),
     )
@@ -308,8 +312,12 @@ def create_mcp():
     ) -> dict:
         """Search for in-stock products at a PC Express store.
 
-        Returns up to 10 shoppable products with code, name, brand, price, unit,
-        packageSize, and packageUnit. Use the product code when calling add_to_cart.
+        Returns up to 10 shoppable products. Each has a 'sold_by' field telling
+        the caller how to order it in add_to_cart:
+          - sold_by='each'   → packaged item; pass {sold_by:'each', count:<int>}
+          - sold_by='weight' → bulk produce; pass {sold_by:'weight', kg:<float>}
+        Also includes price_each or price_per_kg so the caller can reason about
+        totals in the user's natural units.
         """
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -329,38 +337,67 @@ def create_mcp():
         for p in data.get("results", []):
             if not p.get("shoppable", True) or p.get("stockStatus", "OK") != "OK":
                 continue
+            code = p.get("code") or ""
             prices = p.get("prices", {})
             price_obj = prices.get("price", {}) or {}
-            product_price = price_obj.get("value") or p.get("price")
-
-            package_size = None
-            package_unit = None
             comp_prices = prices.get("comparisonPrices", [])
-            if comp_prices and product_price is not None:
-                try:
-                    comp = comp_prices[0]
-                    size_value = (product_price / comp["price"]) * comp["quantity"]
-                    package_size = round(size_value) if size_value >= 10 else round(size_value, 1)
-                    package_unit = comp.get("unit", "")
-                except (ZeroDivisionError, KeyError, TypeError):
-                    pass
 
-            products.append(
-                {
-                    "code": p.get("code"),
-                    "name": p.get("name"),
-                    "brand": p.get("brand"),
-                    "price": product_price,
-                    "unit": price_obj.get("unit", ""),
-                    "packageSize": package_size,
-                    "packageUnit": package_unit,
-                }
-            )
+            is_weighted = code.endswith("_KG") or (p.get("uom") or "").upper() == "KG"
+            entry: dict = {
+                "code": code,
+                "name": p.get("name"),
+                "brand": p.get("brand"),
+            }
+            if is_weighted:
+                kg_comp = next(
+                    (c for c in comp_prices if (c.get("unit") or "").lower() == "kg"),
+                    None,
+                )
+                price_per_kg = kg_comp.get("value") if kg_comp else None
+                # price.quantity+unit describes the selling increment
+                # (e.g. quantity=100, unit='g' → 0.1 kg step).
+                step_g = price_obj.get("quantity") or 100
+                step_kg = round(step_g / 1000, 3)
+                entry.update(
+                    {
+                        "sold_by": "weight",
+                        "price_per_kg": price_per_kg,
+                        "step_kg": step_kg,
+                        "how_to_order": (
+                            f"{{sold_by:'weight', kg:<float>}} — e.g. kg=2.0 for 2 kg. "
+                            f"Step: {step_kg} kg."
+                        ),
+                    }
+                )
+            else:
+                entry.update(
+                    {
+                        "sold_by": "each",
+                        "price_each": price_obj.get("value") or p.get("price"),
+                        "package_size": p.get("packageSize") or None,
+                        "how_to_order": (
+                            "{sold_by:'each', count:<int>} — e.g. count=2 for 2 units."
+                        ),
+                    }
+                )
+            products.append(entry)
         return {"products": products}
 
-    class CartItem(BaseModel):
+    class EachItem(BaseModel):
         product_code: str
-        quantity: int
+        sold_by: Literal["each"]
+        count: int = Field(gt=0, description="Number of units/packages to buy.")
+
+    class WeightItem(BaseModel):
+        product_code: str
+        sold_by: Literal["weight"]
+        kg: float = Field(gt=0, description="Weight in kilograms, e.g. 2.0 for 2 kg.")
+
+    CartItem = Annotated[Union[EachItem, WeightItem], Field(discriminator="sold_by")]
+
+    # PCX bulk produce sells in 100 g increments. If this ever differs per
+    # product, PCX returns an error we surface in failed_items.
+    WEIGHT_INCREMENT_G = 100
 
     @mcp.tool()
     async def superstore_add_to_cart(
@@ -371,18 +408,52 @@ def create_mcp():
     ) -> dict:
         """Add items to a PC Express shopping cart.
 
-        Returns added_items (successfully added with name and quantity) and
-        failed_items (with product_code and reason). Always check failed_items
-        and inform the user of any items that could not be added.
+        Each item's shape must match the sold_by from search_products:
+          - {product_code, sold_by: 'each',   count: <int>}   # packaged
+          - {product_code, sold_by: 'weight', kg:    <float>} # bulk produce
+        Passing 'each' for a weight-sold product (code ends in _KG) — or
+        vice versa — returns a clear reason in failed_items.
+
+        Returns added_items (with name and either count or kg reflecting what
+        was actually added) and failed_items. Always surface failed_items.
         """
-        entries = {
-            item.product_code: {
-                "quantity": item.quantity,
-                "fulfillmentMethod": "pickup",
-                "sellerId": store_id,
-            }
-            for item in items
-        }
+        entries: dict = {}
+        failed_items: list[dict] = []
+        for item in items:
+            code_is_weighted = item.product_code.endswith("_KG")
+            if isinstance(item, WeightItem):
+                if not code_is_weighted:
+                    failed_items.append(
+                        {
+                            "product_code": item.product_code,
+                            "reason": "Product is sold_by='each' — pass count, not kg.",
+                        }
+                    )
+                    continue
+                increments = max(1, round(item.kg * 1000 / WEIGHT_INCREMENT_G))
+                entries[item.product_code] = {
+                    "quantity": increments,
+                    "fulfillmentMethod": "pickup",
+                    "sellerId": store_id,
+                }
+            else:
+                if code_is_weighted:
+                    failed_items.append(
+                        {
+                            "product_code": item.product_code,
+                            "reason": "Product is sold_by='weight' — pass kg, not count.",
+                        }
+                    )
+                    continue
+                entries[item.product_code] = {
+                    "quantity": item.count,
+                    "fulfillmentMethod": "pickup",
+                    "sellerId": store_id,
+                }
+
+        if not entries:
+            return {"added_items": [], "failed_items": failed_items}
+
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts/{cart_id}",
@@ -391,25 +462,30 @@ def create_mcp():
             )
         data = resp.json()
 
-        requested_codes = {item.product_code for item in items}
+        requested_codes = set(entries.keys())
         added_codes: set[str] = set()
         added_items = []
         cart_obj = data.get("cart", data)
         for order in cart_obj.get("orders", []):
             for entry in order.get("entries", []):
-                product = entry.get("offer", {}).get("product", {})
-                code = product.get("code") or product.get("id", "")
-                if code in requested_codes:
-                    added_codes.add(code)
-                    added_items.append(
-                        {
-                            "product_code": code,
-                            "name": product.get("name", ""),
-                            "quantity": entry.get("quantity", 0),
-                        }
-                    )
+                offer = entry.get("offer", {})
+                product = offer.get("product", {})
+                code = product.get("code") or offer.get("id", "")
+                if code not in requested_codes:
+                    continue
+                added_codes.add(code)
+                raw_qty = entry.get("quantity", 0)
+                if offer.get("sellingType") == "SOLD_BY_WEIGHT":
+                    increment = offer.get("sellingIncrement") or WEIGHT_INCREMENT_G
+                    selling_unit = (offer.get("sellingUnit") or "").upper()
+                    grams = raw_qty * increment * (1 if selling_unit == "G" else 1000)
+                    natural = {"kg": round(grams / 1000, 3)}
+                else:
+                    natural = {"count": int(raw_qty)}
+                added_items.append(
+                    {"product_code": code, "name": product.get("name", ""), **natural}
+                )
 
-        failed_items = []
         for err in data.get("errors", []):
             failed_items.append(
                 {
@@ -418,12 +494,12 @@ def create_mcp():
                 }
             )
         failed_codes = {f["product_code"] for f in failed_items}
-        for item in items:
-            if item.product_code not in added_codes and item.product_code not in failed_codes:
+        for code in requested_codes:
+            if code not in added_codes and code not in failed_codes:
                 failed_items.append(
                     {
-                        "product_code": item.product_code,
-                        "reason": "Not found in cart after adding — may be unavailable",
+                        "product_code": code,
+                        "reason": "Not found in cart after adding — may be unavailable.",
                     }
                 )
 
