@@ -506,6 +506,65 @@ def create_mcp():
         return {"added_items": added_items, "failed_items": failed_items}
 
     @mcp.tool()
+    async def superstore_remove_from_cart(
+        cart_id: str,
+        store_id: str,
+        banner: str,
+        product_codes: list[str],
+    ) -> dict:
+        """Remove items from a PC Express shopping cart by product code.
+
+        Works for both 'each' and 'weight' products — no count or kg needed,
+        the whole line is dropped. Pass the same product_code the item was
+        added with (the one returned by search_products).
+
+        Returns removed_items and failed_items (with reason). Always surface
+        failed_items.
+        """
+        # PCX (SAP Hybris) treats quantity=0 on an existing line as a removal.
+        entries = {
+            code: {"quantity": 0, "fulfillmentMethod": "pickup", "sellerId": store_id}
+            for code in product_codes
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{PCX_BASE}/carts/{cart_id}",
+                headers=pcx_headers(banner),
+                json={"entries": entries},
+            )
+        data = resp.json()
+
+        remaining_codes: set[str] = set()
+        cart_obj = data.get("cart", data)
+        for order in cart_obj.get("orders", []):
+            for entry in order.get("entries", []):
+                offer = entry.get("offer", {})
+                product = offer.get("product", {})
+                code = product.get("code") or offer.get("id", "")
+                if code:
+                    remaining_codes.add(code)
+
+        removed_items = []
+        failed_items = []
+        for code in product_codes:
+            if code not in remaining_codes:
+                removed_items.append({"product_code": code})
+            else:
+                failed_items.append(
+                    {"product_code": code, "reason": "Still in cart after removal attempt."}
+                )
+
+        failed_codes = {f["product_code"] for f in failed_items}
+        for err in data.get("errors", []):
+            pc = err.get("productCode", "")
+            if pc and pc not in failed_codes:
+                failed_items.append(
+                    {"product_code": pc, "reason": err.get("message", "Unknown error")}
+                )
+
+        return {"removed_items": removed_items, "failed_items": failed_items}
+
+    @mcp.tool()
     async def superstore_finish_shopping(cart_id: str, banner: str) -> dict:
         """Get the checkout URL for a cart. The URL forces the cart ID so the user
         can review and complete their order in the browser.
