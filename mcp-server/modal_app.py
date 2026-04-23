@@ -341,8 +341,9 @@ def create_mcp():
             prices = p.get("prices", {})
             price_obj = prices.get("price", {}) or {}
             comp_prices = prices.get("comparisonPrices", [])
+            pu = p.get("pricingUnits") or {}
 
-            is_weighted = code.endswith("_KG") or (p.get("uom") or "").upper() == "KG"
+            is_weighted = pu.get("type") == "SOLD_BY_WEIGHT" or pu.get("weighted") is True
             entry: dict = {
                 "code": code,
                 "name": p.get("name"),
@@ -353,30 +354,38 @@ def create_mcp():
                     (c for c in comp_prices if (c.get("unit") or "").lower() == "kg"),
                     None,
                 )
-                price_per_kg = kg_comp.get("value") if kg_comp else None
-                # price.quantity+unit describes the selling increment
-                # (e.g. quantity=100, unit='g' → 0.1 kg step).
-                step_g = price_obj.get("quantity") or 100
-                step_kg = round(step_g / 1000, 3)
+                # pricingUnits.unit is 'g' for almost all PCX produce; convert to kg.
+                pu_unit = (pu.get("unit") or "g").lower()
+                to_kg = (lambda x: x / 1000) if pu_unit == "g" else (lambda x: float(x))
+                step_kg = round(to_kg(pu.get("interval") or 100), 3)
+                min_kg = round(to_kg(pu.get("minOrderQuantity") or 100), 3)
+                max_q = pu.get("maxOrderQuantity")
+                max_kg = round(to_kg(max_q), 3) if max_q else None
                 entry.update(
                     {
                         "sold_by": "weight",
-                        "price_per_kg": price_per_kg,
+                        "price_per_kg": kg_comp.get("value") if kg_comp else None,
                         "step_kg": step_kg,
+                        "min_kg": min_kg,
+                        "max_kg": max_kg,
                         "how_to_order": (
-                            f"{{sold_by:'weight', kg:<float>}} — e.g. kg=2.0 for 2 kg. "
-                            f"Step: {step_kg} kg."
+                            f"{{sold_by:'weight', kg:<float>}} — e.g. kg=0.5 for 500 g. "
+                            f"Step {step_kg} kg, min {min_kg} kg"
+                            + (f", max {max_kg} kg per cart line." if max_kg else ".")
                         ),
                     }
                 )
             else:
+                max_count = pu.get("maxOrderQuantity")
                 entry.update(
                     {
                         "sold_by": "each",
                         "price_each": price_obj.get("value") or p.get("price"),
                         "package_size": p.get("packageSize") or None,
+                        "max_count": int(max_count) if max_count else None,
                         "how_to_order": (
                             "{sold_by:'each', count:<int>} — e.g. count=2 for 2 units."
+                            + (f" Max {int(max_count)} per cart line." if max_count else "")
                         ),
                     }
                 )
@@ -395,8 +404,9 @@ def create_mcp():
 
     CartItem = Annotated[Union[EachItem, WeightItem], Field(discriminator="sold_by")]
 
-    # PCX bulk produce sells in 100 g increments. If this ever differs per
-    # product, PCX returns an error we surface in failed_items.
+    # PCX weight-sold produce: the cart `quantity` field holds the LITERAL
+    # weight in grams (verified by replaying the website's own POST), with a
+    # 100 g minimum and 100 g step. So 2 kg → quantity=2000.
     WEIGHT_INCREMENT_G = 100
 
     @mcp.tool()
@@ -430,9 +440,10 @@ def create_mcp():
                         }
                     )
                     continue
-                increments = max(1, round(item.kg * 1000 / WEIGHT_INCREMENT_G))
+                grams = round(item.kg * 1000 / WEIGHT_INCREMENT_G) * WEIGHT_INCREMENT_G
+                grams = max(WEIGHT_INCREMENT_G, grams)
                 entries[item.product_code] = {
-                    "quantity": increments,
+                    "quantity": grams,
                     "fulfillmentMethod": "pickup",
                     "sellerId": store_id,
                 }
@@ -476,10 +487,9 @@ def create_mcp():
                 added_codes.add(code)
                 raw_qty = entry.get("quantity", 0)
                 if offer.get("sellingType") == "SOLD_BY_WEIGHT":
-                    increment = offer.get("sellingIncrement") or WEIGHT_INCREMENT_G
                     selling_unit = (offer.get("sellingUnit") or "").upper()
-                    grams = raw_qty * increment * (1 if selling_unit == "G" else 1000)
-                    natural = {"kg": round(grams / 1000, 3)}
+                    kg = raw_qty if selling_unit == "KG" else raw_qty / 1000
+                    natural = {"kg": round(kg, 3)}
                 else:
                     natural = {"count": int(raw_qty)}
                 added_items.append(
@@ -487,10 +497,17 @@ def create_mcp():
                 )
 
         for err in data.get("errors", []):
+            msg = err.get("message", "Unknown error")
+            if "exceeds maximum" in msg.lower():
+                msg += (
+                    " Each PCX cart line is capped per product (see max_kg / max_count "
+                    "in search_products). Re-call search_products for the limit, or "
+                    "split the order across multiple products."
+                )
             failed_items.append(
                 {
                     "product_code": err.get("productCode", ""),
-                    "reason": err.get("message", "Unknown error"),
+                    "reason": msg,
                 }
             )
         failed_codes = {f["product_code"] for f in failed_items}
