@@ -419,10 +419,12 @@ def create_mcp():
         """Add items to a PC Express shopping cart.
 
         Each item's shape must match the sold_by from search_products:
-          - {product_code, sold_by: 'each',   count: <int>}   # packaged
-          - {product_code, sold_by: 'weight', kg:    <float>} # bulk produce
-        Passing 'each' for a weight-sold product (code ends in _KG) — or
-        vice versa — returns a clear reason in failed_items.
+          - {product_code, sold_by: 'each',   count: <int>}   # packaged or
+                                                              # priced-by-weight loose
+          - {product_code, sold_by: 'weight', kg:    <float>} # true bulk produce
+        Always trust the `sold_by` returned by search — the product code's
+        `_KG`/`_EA` suffix is NOT a reliable indicator (loose apples are coded
+        `_KG` but sold by piece).
 
         Returns added_items (with name and either count or kg reflecting what
         was actually added) and failed_items. Always surface failed_items.
@@ -430,16 +432,7 @@ def create_mcp():
         entries: dict = {}
         failed_items: list[dict] = []
         for item in items:
-            code_is_weighted = item.product_code.endswith("_KG")
             if isinstance(item, WeightItem):
-                if not code_is_weighted:
-                    failed_items.append(
-                        {
-                            "product_code": item.product_code,
-                            "reason": "Product is sold_by='each' — pass count, not kg.",
-                        }
-                    )
-                    continue
                 grams = round(item.kg * 1000 / WEIGHT_INCREMENT_G) * WEIGHT_INCREMENT_G
                 grams = max(WEIGHT_INCREMENT_G, grams)
                 entries[item.product_code] = {
@@ -448,14 +441,6 @@ def create_mcp():
                     "sellerId": store_id,
                 }
             else:
-                if code_is_weighted:
-                    failed_items.append(
-                        {
-                            "product_code": item.product_code,
-                            "reason": "Product is sold_by='weight' — pass kg, not count.",
-                        }
-                    )
-                    continue
                 entries[item.product_code] = {
                     "quantity": item.count,
                     "fulfillmentMethod": "pickup",
