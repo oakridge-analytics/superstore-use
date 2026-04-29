@@ -1058,8 +1058,8 @@ async function handleToolCall(event: any) {
       if (p.code && p.name) {
         const displayName = p.brand ? `${p.brand} ${p.name}` : p.name;
         state.productNames[p.code] = displayName;
-        if (p.packageSize && p.packageUnit) {
-          state.productSizes[p.code] = `${p.packageSize} ${p.packageUnit}`;
+        if (p.package_size) {
+          state.productSizes[p.code] = String(p.package_size);
         }
       }
     }
@@ -1070,7 +1070,8 @@ async function handleToolCall(event: any) {
       for (const item of result.added_items) {
         const displayName = state.productNames[item.product_code] || item.name || item.product_code;
         const size = state.productSizes[item.product_code];
-        addCartItem(displayName, `x${item.quantity}`, item.product_code, size);
+        const qty = item.kg != null ? `${item.kg} kg` : `x${item.count || 1}`;
+        addCartItem(displayName, qty, item.product_code, size);
       }
       showCartLink();
     }

@@ -89,6 +89,16 @@ You are a friendly, efficient voice shopping assistant for PC Express. You help 
 - Batch multiple items into a single `add_to_cart` call when possible.
 - After adding, give a quick summary: "Added chicken, rice, and broccoli. Anything else?"
 
+# Understanding sold_by Types
+
+Each search result has a `sold_by` field:
+- `sold_by='each'` → packaged item or loose produce priced by weight at checkout (e.g. bags of rice, loose apples). Order with `count` (number of units/pieces).
+- `sold_by='weight'` → true bulk produce sold from a bin (e.g. bulk mushrooms, deli meat by the gram). Order with `kg` (kilograms, e.g. 0.5 for 500g).
+
+When the user says "2 kg of chicken breast" and it's sold_by='each', add count=1 (one package). When they say "500g of mushrooms" and it's sold_by='weight', add kg=0.5.
+
+Do NOT guess the sold_by type from the product name or code — always use the value from search results.
+
 # IMPORTANT RULES
 
 - IF the user asks about anything unrelated to groceries or food IMMEDIATELY call `finish_shopping` with `reason: "off_topic"`.
@@ -114,7 +124,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "search_products",
-        "description": "Search for products at a store. Pass the store_id and banner from find_nearest_stores results. Only returns in-stock products.",
+        "description": "Search for products at a store. Each result has a 'sold_by' field: 'each' (packaged or loose priced-by-weight — order with count) or 'weight' (true bulk produce — order with kg). Always use sold_by to decide how to add to cart.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -131,7 +141,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "add_to_cart",
-        "description": "Add items to the shopping cart. Returns added_items (successfully added) and failed_items (with reason). Check failed_items and inform the user.",
+        "description": "Add items to the shopping cart. Each item must include sold_by from search_products: use 'each' with count (number of units) or 'weight' with kg (kilograms). Returns added_items and failed_items.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -141,11 +151,23 @@ TOOLS = [
                         "type": "object",
                         "properties": {
                             "product_code": {"type": "string"},
-                            "quantity": {"type": "number"},
+                            "sold_by": {
+                                "type": "string",
+                                "enum": ["each", "weight"],
+                                "description": "Must match the sold_by from search_products",
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": "Number of units/packages (required when sold_by='each')",
+                            },
+                            "kg": {
+                                "type": "number",
+                                "description": "Weight in kilograms, e.g. 0.5 for 500g (required when sold_by='weight')",
+                            },
                         },
-                        "required": ["product_code", "quantity"],
+                        "required": ["product_code", "sold_by"],
                     },
-                    "description": "Items to add with product code and quantity",
+                    "description": "Items to add. Use {product_code, sold_by:'each', count:N} or {product_code, sold_by:'weight', kg:N}",
                 },
             },
             "required": ["items"],
@@ -524,35 +546,52 @@ def create_web_app():
             prices = p.get("prices", {})
             price_obj = prices.get("price", {}) or {}
             product_price = price_obj.get("value") or p.get("price")
-
-            # Calculate package size from comparison prices (same approach as eval cart_checker)
             comp_prices = prices.get("comparisonPrices", [])
-            package_size = None
-            package_unit = None
-            if comp_prices and product_price is not None:
-                comp = comp_prices[0]
-                try:
-                    size_value = (product_price / comp["price"]) * comp["quantity"]
-                    size_rounded = round(size_value) if size_value >= 10 else round(size_value, 1)
-                    package_size = size_rounded
-                    package_unit = comp.get("unit", "")
-                except (ZeroDivisionError, KeyError, TypeError):
-                    pass
+            pu = p.get("pricingUnits") or {}
 
-            item = {
+            is_weighted = pu.get("type") == "SOLD_BY_WEIGHT" or pu.get("weighted") is True
+
+            item: dict = {
                 "code": p.get("code"),
                 "name": p.get("name"),
                 "brand": p.get("brand"),
-                "price": product_price,
-                "unit": price_obj.get("unit", ""),
-                "packageSize": package_size,
-                "packageUnit": package_unit,
             }
-            print(
-                f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} ${item['price']} / {item['unit']} ({package_size} {package_unit})"
-            )
+            if is_weighted:
+                kg_comp = next(
+                    (c for c in comp_prices if (c.get("unit") or "").lower() == "kg"),
+                    None,
+                )
+                pu_unit = (pu.get("unit") or "g").lower()
+                to_kg = (lambda x: x / 1000) if pu_unit == "g" else (lambda x: float(x))
+                step_kg = round(to_kg(pu.get("interval") or 100), 3)
+                min_kg = round(to_kg(pu.get("minOrderQuantity") or 100), 3)
+                max_q = pu.get("maxOrderQuantity")
+                max_kg = round(to_kg(max_q), 3) if max_q else None
+                item.update({
+                    "sold_by": "weight",
+                    "price_per_kg": kg_comp.get("value") if kg_comp else None,
+                    "step_kg": step_kg,
+                    "min_kg": min_kg,
+                    "max_kg": max_kg,
+                })
+                print(
+                    f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} sold_by=weight ${item['price_per_kg']}/kg"
+                )
+            else:
+                max_count = pu.get("maxOrderQuantity")
+                item.update({
+                    "sold_by": "each",
+                    "price": product_price,
+                    "package_size": p.get("packageSize") or None,
+                    "max_count": int(max_count) if max_count else None,
+                })
+                print(
+                    f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} sold_by=each ${product_price}"
+                )
             results.append(item)
         return {"products": results}
+
+    WEIGHT_INCREMENT_G = 100
 
     @web_app.post("/api/add-to-cart")
     async def add_to_cart(request: Request):
@@ -564,16 +603,31 @@ def create_web_app():
 
         _log("add_to_cart", items=len(items), cart_id=cart_id, store_id=store_id, banner=banner)
         _inc("items_added", len(items))
-        for item in items:
-            print(f"[add-to-cart]   {item['product_code']} x{item['quantity']}")
 
         entries = {}
+        item_sold_by = {}
         for item in items:
-            entries[item["product_code"]] = {
-                "quantity": item["quantity"],
-                "fulfillmentMethod": "pickup",
-                "sellerId": store_id,
-            }
+            code = item["product_code"]
+            sold_by = item.get("sold_by", "each")
+            item_sold_by[code] = sold_by
+            if sold_by == "weight":
+                kg = float(item.get("kg", 0))
+                grams = round(kg * 1000 / WEIGHT_INCREMENT_G) * WEIGHT_INCREMENT_G
+                grams = max(WEIGHT_INCREMENT_G, grams)
+                entries[code] = {
+                    "quantity": grams,
+                    "fulfillmentMethod": "pickup",
+                    "sellerId": store_id,
+                }
+                print(f"[add-to-cart]   {code} sold_by=weight kg={kg} -> {grams}g")
+            else:
+                count = int(item.get("count", item.get("quantity", 1)))
+                entries[code] = {
+                    "quantity": count,
+                    "fulfillmentMethod": "pickup",
+                    "sellerId": store_id,
+                }
+                print(f"[add-to-cart]   {code} sold_by=each count={count}")
 
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -586,38 +640,40 @@ def create_web_app():
         if resp.status_code != 200:
             print(f"[add-to-cart] Error response: {json.dumps(data, indent=2)}")
 
-        # Parse which items actually made it into the cart
-        requested_codes = {item["product_code"] for item in items}
+        requested_codes = set(entries.keys())
         added_codes = set()
         added_items = []
-        cart_obj = data.get("cart", data)  # response may nest under "cart" or be top-level
+        cart_obj = data.get("cart", data)
         for order in cart_obj.get("orders", []):
             for entry in order.get("entries", []):
-                product = entry.get("offer", {}).get("product", {})
-                code = product.get("code") or product.get("id", "")
-                if code in requested_codes:
-                    added_codes.add(code)
-                    name = entry.get("offer", {}).get("product", {}).get("name", "")
-                    qty = entry.get("quantity", 0)
-                    added_items.append(
-                        {
-                            "product_code": code,
-                            "name": name,
-                            "quantity": qty,
-                        }
-                    )
-                    print(f"[add-to-cart]   OK {code} {name!r} x{qty}")
+                offer = entry.get("offer", {})
+                product = offer.get("product", {})
+                code = product.get("code") or offer.get("id", "")
+                if code not in requested_codes:
+                    continue
+                added_codes.add(code)
+                raw_qty = entry.get("quantity", 0)
+                if offer.get("sellingType") == "SOLD_BY_WEIGHT" or item_sold_by.get(code) == "weight":
+                    selling_unit = (offer.get("sellingUnit") or "").upper()
+                    kg = raw_qty if selling_unit == "KG" else raw_qty / 1000
+                    natural = {"kg": round(kg, 3)}
+                else:
+                    natural = {"count": int(raw_qty)}
+                added_items.append(
+                    {"product_code": code, "name": product.get("name", ""), **natural}
+                )
+                print(f"[add-to-cart]   OK {code} {product.get('name', '')!r} {natural}")
 
-        # Build failed items from API errors + codes not found in cart
         failed_items = []
         for err in data.get("errors", []):
             reason = err.get("message", "Unknown error")
             pc = err.get("productCode", "")
+            if "exceeds maximum" in reason.lower():
+                reason += " Check max_kg or max_count from search results and reduce quantity."
             failed_items.append({"product_code": pc, "reason": reason})
             print(f"[add-to-cart]   FAIL {pc}: {reason}")
         failed_codes = {f["product_code"] for f in failed_items}
-        for item in items:
-            code = item["product_code"]
+        for code in requested_codes:
             if code not in added_codes and code not in failed_codes:
                 reason = "Item not found in cart after adding — may be unavailable"
                 failed_items.append({"product_code": code, "reason": reason})
