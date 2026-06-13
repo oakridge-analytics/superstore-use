@@ -1,8 +1,19 @@
+import logging
+import sys
+
 import modal
 
 image = modal.Image.debian_slim(python_version="3.12").pip_install("fastmcp>=2.3", "httpx")
 
 app = modal.App("superstore-mcp")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+log = logging.getLogger("superstore-mcp")
 
 PCX_BASE = "https://api.pcexpress.ca/pcx-bff/api/v1"
 PCX_BASE_HEADERS = {
@@ -182,6 +193,26 @@ def create_mcp():
     from fastmcp import FastMCP
     from pydantic import BaseModel, Field
 
+    def _pcx_proxy() -> str | None:
+        """Build the Oxylabs proxy URL for PCX/Mapbox calls.
+
+        PC Express's WAF returns 403 to Modal's datacenter egress IPs, which
+        silently forces the static fallback store list and breaks carts.
+        Routing through the residential proxy restores live API access.
+        Returns None if proxy creds aren't configured (callers go direct).
+        """
+        server = os.environ.get("PROXY_SERVER")
+        user = os.environ.get("PROXY_USERNAME")
+        pw = os.environ.get("PROXY_PASSWORD")
+        if not all([server, user, pw]):
+            log.warning("oxy-proxy creds missing — PCX calls will likely 403")
+            return None
+        hostport = re.sub(r"^https?://", "", server).rstrip("/")
+        return f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{hostport}"
+
+    def _client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(proxy=_pcx_proxy(), timeout=30.0)
+
     mcp = FastMCP(
         "Superstore Shopping",
         instructions=(
@@ -205,6 +236,7 @@ def create_mcp():
         Returns up to 3 stores sorted by distance. Each store has storeId, banner, name, bannerName,
         address, and distance_km. Pass storeId and banner to create_cart and search_products.
         """
+        log.info("find_nearest_stores: location=%r", location)
         CA_POSTAL_RE = re.compile(r"^([A-Za-z]\d[A-Za-z])\s*(\d[A-Za-z]\d)$")
         mapbox_token = os.environ.get("MAPBOX_API_KEY", "")
 
@@ -220,9 +252,11 @@ def create_mcp():
             )
             resp = await client.get(url)
             if resp.status_code != 200:
+                log.warning("geocode failed: query=%r status=%d", query, resp.status_code)
                 return None
             features = resp.json().get("features", [])
             if not features:
+                log.warning("geocode: no features for query=%r", query)
                 return None
             coords = features[0]["geometry"]["coordinates"]  # [lon, lat]
             return {"lat": coords[1], "lon": coords[0]}
@@ -234,22 +268,35 @@ def create_mcp():
                     headers=pcx_headers(banner),
                 )
                 if resp.status_code != 200:
+                    log.warning(
+                        "pickup-locations %s: status=%d → fallback",
+                        banner,
+                        resp.status_code,
+                    )
                     return _expand_fallback(banner)
                 data = resp.json()
                 locs = data if isinstance(data, list) else data.get("pickupLocations", [])
-                return locs if locs else _expand_fallback(banner)
-            except Exception:
+                if not locs:
+                    log.warning("pickup-locations %s: empty → fallback", banner)
+                    return _expand_fallback(banner)
+                log.info("pickup-locations %s: %d stores", banner, len(locs))
+                return locs
+            except Exception as exc:
+                log.warning("pickup-locations %s: exception=%r → fallback", banner, exc)
                 return _expand_fallback(banner)
 
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             geo = await geocode(q, client)
             if not geo:
+                log.warning("find_nearest_stores: could not geocode %r", location)
                 return {"error": f"Could not geocode location: {location!r}"}
             lat, lon = geo["lat"], geo["lon"]
+            log.info("geocoded %r → lat=%.4f lon=%.4f", q, lat, lon)
 
             locs_lists = await asyncio.gather(*[fetch_banner_locs(b, client) for b in BANNERS])
 
         all_locs = [loc for locs in locs_lists for loc in locs]
+        log.info("find_nearest_stores: aggregated %d stores across banners", len(all_locs))
 
         def haversine(loc) -> float:
             gp = loc.get("geoPoint", {})
@@ -264,7 +311,7 @@ def create_mcp():
             return 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
         top3 = sorted(all_locs, key=haversine)[:3]
-        return {
+        result = {
             "stores": [
                 {
                     "storeId": loc.get("storeId"),
@@ -277,6 +324,11 @@ def create_mcp():
                 for loc in top3
             ]
         }
+        log.info(
+            "find_nearest_stores → top3: %s",
+            [(s["storeId"], s["banner"], s["distance_km"]) for s in result["stores"]],
+        )
+        return result
 
     @mcp.tool()
     async def superstore_create_cart(store_id: str, banner: str) -> dict:
@@ -286,16 +338,21 @@ def create_mcp():
         Returns cart_id (required for search_products and add_to_cart), and a cart_url
         the user can visit to review and checkout their cart.
         """
-        async with httpx.AsyncClient() as client:
+        log.info("create_cart: store_id=%s banner=%s", store_id, banner)
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts",
                 headers=pcx_headers(banner),
                 json={"bannerId": banner, "language": "en", "storeId": store_id},
             )
+        log.info("create_cart: POST /carts status=%d", resp.status_code)
         data = resp.json()
         cart_id = data.get("cartId") or data.get("id")
+        if not cart_id:
+            log.warning("create_cart: no cart_id in response keys=%s", list(data.keys()))
         base_url = CART_URLS.get(banner, CART_URLS["superstore"])
         cart_url = f"{base_url}?forceCartId={cart_id}" if cart_id else base_url
+        log.info("create_cart → cart_id=%s", cart_id)
         return {
             "cart_id": cart_id,
             "store_id": store_id,
@@ -319,7 +376,14 @@ def create_mcp():
         Also includes price_each or price_per_kg so the caller can reason about
         totals in the user's natural units.
         """
-        async with httpx.AsyncClient() as client:
+        log.info(
+            "search_products: term=%r store_id=%s banner=%s cart_id=%s",
+            term,
+            store_id,
+            banner,
+            cart_id or "-",
+        )
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/products/search",
                 headers=pcx_headers(banner),
@@ -332,9 +396,11 @@ def create_mcp():
                     "pagination": {"from": 0, "size": 10},
                 },
             )
+        log.info("search_products: POST /products/search status=%d", resp.status_code)
         data = resp.json()
+        raw_results = data.get("results", [])
         products = []
-        for p in data.get("results", []):
+        for p in raw_results:
             if not p.get("shoppable", True) or p.get("stockStatus", "OK") != "OK":
                 continue
             code = p.get("code") or ""
@@ -390,6 +456,12 @@ def create_mcp():
                     }
                 )
             products.append(entry)
+        log.info(
+            "search_products → %d shoppable of %d raw for term=%r",
+            len(products),
+            len(raw_results),
+            term,
+        )
         return {"products": products}
 
     class EachItem(BaseModel):
@@ -429,6 +501,16 @@ def create_mcp():
         Returns added_items (with name and either count or kg reflecting what
         was actually added) and failed_items. Always surface failed_items.
         """
+        log.info(
+            "add_to_cart: cart_id=%s store_id=%s banner=%s items=%s",
+            cart_id,
+            store_id,
+            banner,
+            [
+                (it.product_code, it.sold_by, getattr(it, "count", getattr(it, "kg", None)))
+                for it in items
+            ],
+        )
         entries: dict = {}
         failed_items: list[dict] = []
         for item in items:
@@ -448,14 +530,17 @@ def create_mcp():
                 }
 
         if not entries:
+            log.warning("add_to_cart: no entries — nothing to send")
             return {"added_items": [], "failed_items": failed_items}
 
-        async with httpx.AsyncClient() as client:
+        log.info("add_to_cart: POST /carts/%s entries=%s", cart_id, entries)
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts/{cart_id}",
                 headers=pcx_headers(banner),
                 json={"entries": entries},
             )
+        log.info("add_to_cart: POST /carts status=%d", resp.status_code)
         data = resp.json()
 
         requested_codes = set(entries.keys())
@@ -505,6 +590,13 @@ def create_mcp():
                     }
                 )
 
+        log.info(
+            "add_to_cart → added=%d failed=%d",
+            len(added_items),
+            len(failed_items),
+        )
+        if failed_items:
+            log.warning("add_to_cart failures: %s", failed_items)
         return {"added_items": added_items, "failed_items": failed_items}
 
     @mcp.tool()
@@ -523,17 +615,25 @@ def create_mcp():
         Returns removed_items and failed_items (with reason). Always surface
         failed_items.
         """
+        log.info(
+            "remove_from_cart: cart_id=%s store_id=%s banner=%s product_codes=%s",
+            cart_id,
+            store_id,
+            banner,
+            product_codes,
+        )
         # PCX (SAP Hybris) treats quantity=0 on an existing line as a removal.
         entries = {
             code: {"quantity": 0, "fulfillmentMethod": "pickup", "sellerId": store_id}
             for code in product_codes
         }
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts/{cart_id}",
                 headers=pcx_headers(banner),
                 json={"entries": entries},
             )
+        log.info("remove_from_cart: POST /carts status=%d", resp.status_code)
         data = resp.json()
 
         remaining_codes: set[str] = set()
@@ -564,6 +664,13 @@ def create_mcp():
                     {"product_code": pc, "reason": err.get("message", "Unknown error")}
                 )
 
+        log.info(
+            "remove_from_cart → removed=%d failed=%d",
+            len(removed_items),
+            len(failed_items),
+        )
+        if failed_items:
+            log.warning("remove_from_cart failures: %s", failed_items)
         return {"removed_items": removed_items, "failed_items": failed_items}
 
     @mcp.tool()
@@ -573,6 +680,7 @@ def create_mcp():
 
         Call this when the user is done adding items and ready to check out.
         """
+        log.info("finish_shopping: cart_id=%s banner=%s", cart_id, banner)
         base_url = CART_URLS.get(banner, CART_URLS["superstore"])
         return {"cart_url": f"{base_url}?forceCartId={cart_id}"}
 
@@ -581,10 +689,13 @@ def create_mcp():
 
 @app.function(
     image=image,
-    secrets=[modal.Secret.from_name("mapbox-api-key")],
+    secrets=[
+        modal.Secret.from_name("mapbox-api-key"),
+        modal.Secret.from_name("oxy-proxy"),
+    ],
     timeout=3600,
     cpu=0.25,
-    memory=256,
+    memory=512,
 )
 @modal.asgi_app()
 def mcp_server():
