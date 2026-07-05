@@ -231,6 +231,31 @@ def create_web_app():
 
     web_app = FastAPI()
 
+    def _pcx_proxy() -> str | None:
+        """Build the Oxylabs proxy URL for PCX/Mapbox calls.
+
+        PC Express's WAF returns 403 to Modal's datacenter egress IPs, which
+        silently forces the static fallback store list and breaks carts.
+        Routing through the residential proxy restores live API access.
+        Returns None if proxy creds aren't configured (callers go direct).
+        """
+        server = os.environ.get("PROXY_SERVER")
+        user = os.environ.get("PROXY_USERNAME")
+        pw = os.environ.get("PROXY_PASSWORD")
+        if not all([server, user, pw]):
+            print("[proxy] oxy-proxy creds missing — PCX/Mapbox calls will likely 403")
+            return None
+        hostport = re.sub(r"^https?://", "", server).rstrip("/")
+        return f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{hostport}"
+
+    def _client() -> httpx.AsyncClient:
+        """httpx client routed through the residential proxy for PCX/Mapbox.
+
+        Use for every api.pcexpress.ca / api.mapbox.com call. OpenAI calls
+        must stay direct (they'd break through a residential exit).
+        """
+        return httpx.AsyncClient(proxy=_pcx_proxy(), timeout=30.0)
+
     def _hash_ip(ip: str) -> str:
         """One-way hash so we can count unique users without storing raw IPs."""
         return hashlib.sha256(ip.encode()).hexdigest()[:12]
@@ -300,35 +325,66 @@ def create_web_app():
         _inc("sessions")
 
         api_key = os.environ["OPENAI_API_KEY"]
+        # GA Realtime API: mint an ephemeral key via /client_secrets. The beta
+        # POST /v1/realtime/sessions endpoint was removed (returns 404), which
+        # silently broke every session. Session config lives under `session`;
+        # audio settings (transcription, VAD, noise reduction, voice) nest under
+        # session.audio.input/output. The ephemeral secret is the top-level
+        # `value` in the response (beta returned it under client_secret.value).
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.openai.com/v1/realtime/sessions",
+                "https://api.openai.com/v1/realtime/client_secrets",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "gpt-realtime",
-                    "voice": "cedar",
-                    "instructions": SYSTEM_PROMPT,
-                    "tools": TOOLS,
-                    "max_response_output_tokens": 1024,
-                    "input_audio_transcription": {
-                        "model": "gpt-4o-mini-transcribe-2025-12-15",
-                    },
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.75,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                    },
-                    "input_audio_noise_reduction": {
-                        "type": "near_field",
+                    "session": {
+                        "type": "realtime",
+                        "model": "gpt-realtime",
+                        "instructions": SYSTEM_PROMPT,
+                        "tools": TOOLS,
+                        "output_modalities": ["audio"],
+                        "max_output_tokens": 1024,
+                        "audio": {
+                            "input": {
+                                "transcription": {
+                                    "model": "gpt-4o-mini-transcribe-2025-12-15",
+                                },
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "threshold": 0.75,
+                                    "prefix_padding_ms": 300,
+                                    "silence_duration_ms": 500,
+                                },
+                                "noise_reduction": {
+                                    "type": "near_field",
+                                },
+                            },
+                            "output": {
+                                "voice": "cedar",
+                            },
+                        },
                     },
                 },
             )
         data = resp.json()
-        _log("session_ready", session_id=session_id, model=data.get("model", "?"))
+        if resp.status_code != 200 or "value" not in data:
+            _log(
+                "session_error",
+                session_id=session_id,
+                status=resp.status_code,
+                detail=str(data.get("error", data))[:300],
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": "Failed to create realtime session"},
+            )
+        _log(
+            "session_ready",
+            session_id=session_id,
+            model=data.get("session", {}).get("model", "?"),
+        )
         return data
 
     @web_app.get("/api/stats")
@@ -429,7 +485,7 @@ def create_web_app():
                 print(f"[find-stores] {banner}: error fetching locations: {e}")
                 return []
 
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             # Normalize Canadian postal codes (e.g. "t2k 0a5" -> "T2K 0A5")
             postal = normalize_postal(query)
             if postal and postal != query:
@@ -495,7 +551,7 @@ def create_web_app():
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
         _log("create_cart", store_id=store_id, banner=banner)
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts",
                 headers=pcx_headers(banner),
@@ -517,7 +573,7 @@ def create_web_app():
         banner = body.get("banner", "superstore")
         _log("search", term=f'"{term}"', store_id=store_id, banner=banner)
         _inc("searches")
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/products/search",
                 headers=pcx_headers(banner),
@@ -629,7 +685,7 @@ def create_web_app():
                 }
                 print(f"[add-to-cart]   {code} sold_by=each count={count}")
 
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts/{cart_id}",
                 headers=pcx_headers(banner),
@@ -708,7 +764,7 @@ def create_web_app():
                 "sellerId": store_id,
             }
 
-        async with httpx.AsyncClient() as client:
+        async with _client() as client:
             resp = await client.post(
                 f"{PCX_BASE}/carts/{cart_id}",
                 headers=pcx_headers(banner),
@@ -793,6 +849,7 @@ def create_web_app():
         modal.Secret.from_name("pc-express-voice-openai"),
         modal.Secret.from_name("mapbox-api-key"),
         modal.Secret.from_name("pc-express-voice-app-token"),
+        modal.Secret.from_name("oxy-proxy"),
     ],
     timeout=3600,
     cpu=0.25,

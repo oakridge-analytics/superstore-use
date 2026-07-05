@@ -5,7 +5,9 @@
 
 // ─── Constants ───
 const REALTIME_MODEL = "gpt-realtime";
-const REALTIME_URL = `https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
+// GA Realtime WebRTC SDP exchange. Beta used /v1/realtime; GA moved it to
+// /v1/realtime/calls (the beta path now 404s).
+const REALTIME_URL = `https://api.openai.com/v1/realtime/calls?model=${REALTIME_MODEL}`;
 
 // gpt-realtime pricing (USD per token)
 // https://openai.com/api/pricing/
@@ -763,7 +765,10 @@ async function startSession() {
     });
     if (!tokenRes.ok) throw new Error("Token request failed: " + tokenRes.status);
     const tokenData = await tokenRes.json();
-    const ephemeralKey = tokenData.client_secret.value;
+    // GA /client_secrets returns the ephemeral key as top-level `value`;
+    // fall back to the beta client_secret.value shape for safety.
+    const ephemeralKey = tokenData.value ?? tokenData.client_secret?.value;
+    if (!ephemeralKey) throw new Error("No ephemeral key in token response");
 
     const pc = new RTCPeerConnection();
     state.pc = pc;
@@ -919,7 +924,9 @@ let currentMsgEl: HTMLElement | null = null;
 
 function handleServerEvent(event: any) {
   switch (event.type) {
+    // GA renamed these with an `output_` prefix; handle both beta and GA names.
     case "response.audio_transcript.delta":
+    case "response.output_audio_transcript.delta":
       clearInactivityTimer();
       setStatus("speaking");
       if (!currentMsgEl) {
@@ -932,6 +939,7 @@ function handleServerEvent(event: any) {
       break;
 
     case "response.audio_transcript.done":
+    case "response.output_audio_transcript.done":
       if (currentMsgEl) {
         currentMsgEl.textContent = event.transcript;
       }
