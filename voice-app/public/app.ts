@@ -83,6 +83,7 @@ interface AppState {
   // Bumped on every response.created — lets requestResponse detect that its
   // response.create was silently rejected (raced a VAD-triggered response).
   responseCreatedCount: number;
+  responseDoneCount: number;
   // Fake mic destination (test mode) — injected audio routes through here
   fakeMicDest: MediaStreamAudioDestinationNode | null;
   // WebSocket transport (Firefox fallback — see WS_MODE)
@@ -143,6 +144,7 @@ const state: AppState = {
   pendingResponse: false,
   toolCallsInFlight: 0,
   responseCreatedCount: 0,
+  responseDoneCount: 0,
   fakeMicDest: null,
   ws: null,
   wsPlaybackGain: null,
@@ -203,7 +205,7 @@ const textSend = document.getElementById("text-send") as HTMLButtonElement;
 
 // ─── Event Listeners ───
 startBtn.addEventListener("click", startSession);
-stopBtn.addEventListener("click", endSession);
+stopBtn.addEventListener("click", () => endSession());
 transcriptToggle.addEventListener("click", toggleTranscript);
 costToggle.addEventListener("click", () => costToggle.classList.toggle("expanded"));
 cartItems.addEventListener("scroll", () => {
@@ -791,13 +793,25 @@ function removeCartItem(productCode: string) {
   }
 }
 
-function showCartLink() {
-  if (state.cart_id) {
-    const a = document.getElementById("cart-link-a") as HTMLAnchorElement;
-    const baseUrl = state.cart_url || "/cart";
-    a.href = `${baseUrl}?forceCartId=${state.cart_id}`;
+function showCartLink(): boolean {
+  if (!state.cart_id && !state.cart_url) {
+    cartLink.style.display = "none";
+    return false;
   }
+  const a = document.getElementById("cart-link-a") as HTMLAnchorElement;
+  let href = state.cart_url || "/cart";
+  if (state.cart_id) {
+    try {
+      const url = new URL(href, window.location.origin);
+      url.searchParams.set("forceCartId", state.cart_id);
+      href = url.toString();
+    } catch {
+      href = `${href.split("?")[0]}?forceCartId=${encodeURIComponent(state.cart_id)}`;
+    }
+  }
+  a.href = href;
   cartLink.style.display = "block";
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -986,7 +1000,7 @@ async function startSession() {
   }
 }
 
-function endSession() {
+function endSession(message: string | null = "Session ended.") {
   clearInactivityTimer();
   if (state.sessionTimer) {
     clearTimeout(state.sessionTimer);
@@ -1047,8 +1061,10 @@ function endSession() {
 
   setStatus("disconnected");
   stopBtn.style.display = "none";
-  addMessage("system", "Session ended.");
-  setCaption("Session ended.", "system");
+  if (message) {
+    addMessage("system", message);
+    setCaption(message, "system");
+  }
 
   if (state.cart_id) {
     showCartLink();
@@ -1058,6 +1074,12 @@ function endSession() {
   setTimeout(() => {
     stopOrbLoop();
   }, 2000);
+}
+
+function endSessionAfterConnectionLoss(message: string) {
+  if (!state.ws && !state.dc && !state.pc && !state.localStream) return;
+  state.awaitingAudioDrain = false;
+  endSession(message);
 }
 
 // Shared by both transports once the event channel is live.
@@ -1146,17 +1168,30 @@ async function startWsTransport(ephemeralKey: string, localStream: MediaStream):
       ["realtime", `openai-insecure-api-key.${ephemeralKey}`],
     );
     state.ws = ws;
+    let opened = false;
     ws.onopen = () => {
+      opened = true;
       startWsCapture(audioCtx, localStream);
       onTransportOpen("WebSocket");
       resolve();
     };
     ws.onmessage = (ev) => handleServerEvent(JSON.parse(ev.data));
-    ws.onerror = () => reject(new Error("WebSocket connection failed"));
+    ws.onerror = () => {
+      if (opened) {
+        endSessionAfterConnectionLoss("Connection lost — please start a new session.");
+      } else {
+        reject(new Error("WebSocket connection failed"));
+      }
+    };
     ws.onclose = (ev) => {
       console.log(`WebSocket closed: ${ev.code} ${ev.reason || ""}`);
-      state.awaitingAudioDrain = false;
-      setStatus("disconnected");
+      if (opened) {
+        endSessionAfterConnectionLoss("Connection lost — please start a new session.");
+      } else {
+        state.awaitingAudioDrain = false;
+        setStatus("disconnected");
+        reject(new Error("WebSocket connection failed"));
+      }
     };
   });
 }
@@ -1353,6 +1388,7 @@ function handleServerEvent(event: any) {
       break;
 
     case "response.done":
+      state.responseDoneCount++;
       state.responseActive = false;
       // Accumulate cost from usage
       if (event.response?.usage) {
@@ -1381,6 +1417,8 @@ function handleServerEvent(event: any) {
         // (flushed by the response.done handler). Don't surface to the user.
         state.pendingResponse = true;
       } else {
+        state.responseActive = false;
+        state.pendingResponse = false;
         addMessage("system", "Error: " + (err.message || "Unknown error"));
         setCaption("Error: " + (err.message || "Unknown"), "system");
       }
@@ -1503,16 +1541,20 @@ async function runToolCall(name: string, args: any): Promise<any> {
       state.localStream.getTracks().forEach(t => t.enabled = false);
     }
     if (result.cart_url) {
+      state.cart_url = result.cart_url;
       const a = document.getElementById("cart-link-a") as HTMLAnchorElement;
       a.href = result.cart_url;
     }
-    showCartLink();
-    addMessage("system", "Shopping complete! Review your cart.");
-    setCaption("Shopping complete!", "system");
+    const hasCartLink = showCartLink();
+    const completeMessage = hasCartLink
+      ? "Shopping complete! Review your cart."
+      : "Shopping complete. No cart was created.";
+    addMessage("system", completeMessage);
+    setCaption(completeMessage, "system");
     // Auto-end the session after the goodbye message finishes.
     const delay = args.reason === "off_topic" ? 8000 : 8000;
     setTimeout(() => {
-      endSession();
+      endSession(null);
     }, delay);
   }
 
@@ -1647,6 +1689,7 @@ async function playAudioBase64(b64: string): Promise<number> {
   transport: state.ws ? "websocket" : state.pc ? "webrtc" : null,
   status: state.currentStatus,
   responseActive: state.responseActive,
+  responseDoneCount: state.responseDoneCount,
   pendingResponse: state.pendingResponse,
   toolCallsInFlight: state.toolCallsInFlight,
   cartId: state.cart_id,

@@ -34,6 +34,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Page, sync_playwright
 
@@ -143,6 +144,36 @@ def settle(page: Page, prev_count: int, timeout_s: float = 120) -> str:
     raise TimeoutError(f"Turn did not settle after {timeout_s}s")
 
 
+def wait_for_finish(
+    page: Page,
+    prev_system_count: int,
+    prev_response_done_count: int,
+    timeout_s: float = 120,
+) -> str:
+    """Wait for finish_shopping's completion message, not a stale cart link."""
+    deadline = time.time() + timeout_s
+    completion = ""
+    while time.time() < deadline:
+        check_for_errors(page)
+        system_msgs = page.locator("#transcript .msg.system").all_inner_texts()
+        new_msgs = [m.strip() for m in system_msgs[prev_system_count:] if m.strip()]
+        if not completion:
+            for msg in new_msgs:
+                if msg.startswith("Shopping complete"):
+                    completion = msg
+                    break
+        if completion:
+            st = status(page)
+            # Require Realtime to finish the assistant's post-tool response;
+            # endSession() also clears active flags, so those alone are weak.
+            response_done = st.get("responseDoneCount", 0) > prev_response_done_count
+            if response_done and not st.get("responseActive") and not st.get("toolCallsInFlight"):
+                return completion
+        time.sleep(0.8)
+    dump_transcript(page)
+    raise TimeoutError(f"finish_shopping completion did not appear after {timeout_s}s")
+
+
 def send_text(page: Page, text: str) -> int:
     """Type a user message; returns assistant-message count before sending."""
     count = page.locator("#transcript .msg.assistant").count()
@@ -242,6 +273,8 @@ def main() -> int:
         for i, utt in enumerate(utterances):
             is_last = i == total - 1
             print(f"[{i + 1}/{total}]")
+            system_count = page.locator("#transcript .msg.system").count() if is_last else 0
+            response_done_count = status(page).get("responseDoneCount", 0) if is_last else 0
             if i in audio_clips:
                 wav, label = audio_clips[i]
                 n = send_audio(page, wav, label)
@@ -249,9 +282,9 @@ def main() -> int:
                 n = send_text(page, utt)
             if is_last:
                 # Final turn: the model should call finish_shopping, which
-                # reveals the cart link (no assistant transcript is guaranteed
-                # after the goodbye, so wait on the link itself).
-                page.wait_for_selector("#cart-link", state="visible", timeout=90_000)
+                # emits a fresh completion system message. The cart link may
+                # already be visible from add_to_cart, so it is not sufficient.
+                wait_for_finish(page, system_count, response_done_count, timeout_s=90)
             else:
                 reply = settle(page, n, timeout_s=120)
                 print(f"<<    {reply}")
@@ -267,6 +300,13 @@ def main() -> int:
 
         if "forceCartId" not in cart_href:
             print(f"FAIL: cart link has no forced cart id: {cart_href}")
+            return 1
+        forced_ids = parse_qs(urlparse(cart_href).query).get("forceCartId", [])
+        if forced_ids != [final_status.get("cartId")]:
+            print(
+                "FAIL: cart link forceCartId does not match app state "
+                f"or appears multiple times: href={cart_href} cartId={final_status.get('cartId')}"
+            )
             return 1
         if not cart_items:
             print("FAIL: no cart items rendered")
