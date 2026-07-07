@@ -34,6 +34,11 @@ const WS_MODE =
   /Firefox/i.test(navigator.userAgent) ||
   new URLSearchParams(window.location.search).get("ws") === "1";
 
+// ?gate=1 forces the half-duplex mic gate on the WS transport (no barge-in).
+// Normally unneeded: assistant audio is looped through a local RTCPeerConnection
+// so the echo canceller treats it as call audio and the mic stays open.
+const FORCE_GATE = new URLSearchParams(window.location.search).get("gate") === "1";
+
 // Orb colors — two states only
 const STATE_COLORS: Record<string, number[]> = {
   active: [0.29, 0.56, 0.96],  // blue
@@ -86,6 +91,10 @@ interface AppState {
   wsPlayCursor: number;
   wsActiveSources: AudioBufferSourceNode[];
   wsCaptureNodes: AudioNode[];
+  wsLoopback: RTCPeerConnection[];
+  // True when the loopback AEC sink failed and audio plays directly — the
+  // capture path then falls back to half-duplex gating.
+  wsDirectOutput: boolean;
   // Diagnostics for the e2e harness
   speechStartedCount: number;
   speechStoppedCount: number;
@@ -140,6 +149,8 @@ const state: AppState = {
   wsPlayCursor: 0,
   wsActiveSources: [],
   wsCaptureNodes: [],
+  wsLoopback: [],
+  wsDirectOutput: false,
   speechStartedCount: 0,
   speechStoppedCount: 0,
   // Audio analysis
@@ -1004,6 +1015,11 @@ function endSession() {
   }
   state.wsCaptureNodes = [];
   state.wsPlaybackGain = null;
+  for (const pc of state.wsLoopback) {
+    try { pc.close(); } catch (_) { }
+  }
+  state.wsLoopback = [];
+  state.wsDirectOutput = false;
   state.awaitingAudioDrain = false;
   state.responseActive = false;
   state.pendingResponse = false;
@@ -1080,12 +1096,46 @@ function onTransportOpen(label: string) {
 async function startWsTransport(ephemeralKey: string, localStream: MediaStream): Promise<void> {
   const audioCtx = state.audioCtx!;
   const analyser = state.analyser!;
-  // Playback chain: PCM chunks → gain → analyser (orb reactivity) → speakers.
+  // Playback chain: PCM chunks → gain → analyser (orb reactivity), and → a
+  // MediaStream looped through a local RTCPeerConnection pair into an <audio>
+  // element. The loopback is what preserves barge-in: audio played as a
+  // WebRTC remote track is part of the browser's echo-canceller reference
+  // (plain WebAudio → speakers is not), so the mic doesn't hear the
+  // assistant's own voice and can stay open while it talks.
   const playbackGain = audioCtx.createGain();
   playbackGain.connect(analyser);
-  analyser.connect(audioCtx.destination);
+  const playbackDest = audioCtx.createMediaStreamDestination();
+  playbackGain.connect(playbackDest);
+  // An idle MediaStreamDestination emits no frames at all — keep the loopback
+  // stream ticking with a constant near-silent source.
+  const keepAlive = audioCtx.createConstantSource();
+  keepAlive.offset.value = 1e-5;
+  keepAlive.connect(playbackDest);
+  keepAlive.start();
   state.wsPlaybackGain = playbackGain;
   state.wsPlayCursor = 0;
+
+  try {
+    if (FORCE_GATE) throw new Error("gate forced via ?gate=1");
+    const remoteStream = await Promise.race([
+      createLoopbackSink(playbackDest.stream),
+      new Promise<never>((_, rej) =>
+        setTimeout(() => rej(new Error("loopback negotiation timeout")), 4000),
+      ),
+    ]);
+    const audioEl = document.createElement("audio");
+    audioEl.autoplay = true;
+    audioEl.style.display = "none";
+    document.body.appendChild(audioEl);
+    audioEl.srcObject = remoteStream;
+    audioEl.play().catch(() => { });
+    state.audioEl = audioEl;
+    state.wsDirectOutput = false;
+  } catch (e: any) {
+    console.warn("Loopback AEC sink unavailable (" + e.message + ") — direct output + half-duplex gate");
+    analyser.connect(audioCtx.destination);
+    state.wsDirectOutput = true;
+  }
 
   await new Promise<void>((resolve, reject) => {
     // Browsers can't set an Authorization header on WebSockets; the ephemeral
@@ -1111,6 +1161,31 @@ async function startWsTransport(ephemeralKey: string, localStream: MediaStream):
   });
 }
 
+// Local WebRTC loopback: pipe a MediaStream out one peer connection and back
+// in another, so playing it counts as "call audio" for echo cancellation.
+async function createLoopbackSink(stream: MediaStream): Promise<MediaStream> {
+  const pcOut = new RTCPeerConnection();
+  const pcIn = new RTCPeerConnection();
+  state.wsLoopback = [pcOut, pcIn];
+  pcOut.onicecandidate = (e) => {
+    if (e.candidate) pcIn.addIceCandidate(e.candidate).catch(() => { });
+  };
+  pcIn.onicecandidate = (e) => {
+    if (e.candidate) pcOut.addIceCandidate(e.candidate).catch(() => { });
+  };
+  const remote = new Promise<MediaStream>((resolve) => {
+    pcIn.ontrack = (e) => resolve(e.streams[0]);
+  });
+  for (const track of stream.getTracks()) pcOut.addTrack(track, stream);
+  const offer = await pcOut.createOffer();
+  await pcOut.setLocalDescription(offer);
+  await pcIn.setRemoteDescription(offer);
+  const answer = await pcIn.createAnswer();
+  await pcIn.setLocalDescription(answer);
+  await pcOut.setRemoteDescription(answer);
+  return remote;
+}
+
 function startWsCapture(audioCtx: AudioContext, stream: MediaStream) {
   const source = audioCtx.createMediaStreamSource(stream);
   // ScriptProcessor is deprecated but universal; 4096 frames ≈ 170 ms @ 24 kHz.
@@ -1125,21 +1200,21 @@ function startWsCapture(audioCtx: AudioContext, stream: MediaStream) {
   // The context is created at 24 kHz in WS mode, but a browser may refuse the
   // hint — decimate if so (crude, fine for speech).
   const ratio = audioCtx.sampleRate / 24000;
-  // Half-duplex gate: WebAudio playback is NOT part of the browser's echo-
-  // canceller reference, so on speakerphone the mic hears the assistant's own
-  // voice and server VAD barges in on itself. While assistant audio is
-  // scheduled (plus a short tail for the room to settle), send silence.
-  // Test mode has no acoustic loop (fake mic), so the gate stays off there —
-  // it would only block injected clips.
+  // Half-duplex fallback gate: only when the loopback AEC sink is unavailable
+  // (wsDirectOutput) or forced via ?gate=1. Direct WebAudio playback isn't in
+  // the echo-canceller reference, so with it the mic would hear the assistant
+  // and VAD would barge in on itself — send silence while audio is scheduled.
+  // Test mode has no acoustic loop (fake mic), so never gate there.
   const ECHO_GUARD_S = 0.35;
-  const gateWhileSpeaking = !TEXT_MODE;
   proc.onaudioprocess = (ev) => {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
     const f32 = ev.inputBuffer.getChannelData(0);
     const outLen = Math.floor(f32.length / ratio);
     const i16 = new Int16Array(outLen); // zero-filled = silence
     const assistantSpeaking =
-      gateWhileSpeaking && audioCtx.currentTime < state.wsPlayCursor + ECHO_GUARD_S;
+      state.wsDirectOutput &&
+      !TEXT_MODE &&
+      audioCtx.currentTime < state.wsPlayCursor + ECHO_GUARD_S;
     if (!assistantSpeaking) {
       for (let i = 0; i < outLen; i++) {
         const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)]));
