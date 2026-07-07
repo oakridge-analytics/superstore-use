@@ -171,6 +171,14 @@ const textComposer = document.getElementById("text-composer")!;
 const textInput = document.getElementById("text-input") as HTMLInputElement;
 const textSend = document.getElementById("text-send") as HTMLButtonElement;
 
+// Firefox can't hold a Realtime WebRTC call open: OpenAI's server stops
+// sending RTP ~30s after the last assistant audio, Firefox reads that as a
+// dead transport (ICE consent) and terminates — verified with idle-session
+// probes; Chromium tolerates the same gap. Warn until we ship a WS fallback.
+if (/Firefox/i.test(navigator.userAgent)) {
+  document.getElementById("browser-note")?.removeAttribute("hidden");
+}
+
 // ─── Event Listeners ───
 startBtn.addEventListener("click", startSession);
 stopBtn.addEventListener("click", endSession);
@@ -835,7 +843,14 @@ async function startSession() {
     const ephemeralKey = tokenData.value ?? tokenData.client_secret?.value;
     if (!ephemeralKey) throw new Error("No ephemeral key in token response");
 
-    const pc = new RTCPeerConnection();
+    // STUN matters: without it Firefox's ICE consent-freshness checks fail
+    // ~35s into the call (even with RTP flowing) and the session silently
+    // dies mid-conversation. Chromium happens to survive host-only ICE.
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+      ],
+    });
     state.pc = pc;
 
     // When remote audio track arrives, attach to audio element.
@@ -937,7 +952,15 @@ async function startSession() {
     await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
 
     pc.oniceconnectionstatechange = () => {
-      if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+      console.log("ICE state: " + pc.iceConnectionState);
+      // "disconnected" can self-heal; "failed" is terminal — tell the user
+      // instead of leaving a zombie session that just goes quiet.
+      if (pc.iceConnectionState === "failed") {
+        state.awaitingAudioDrain = false;
+        addMessage("system", "Connection lost — please start a new session.");
+        setCaption("Connection lost — please start a new session.", "system");
+        endSession();
+      } else if (pc.iceConnectionState === "disconnected") {
         state.awaitingAudioDrain = false;
         setStatus("disconnected");
       }
@@ -1379,6 +1402,7 @@ async function playAudioBase64(b64: string): Promise<number> {
 });
 (window as any).__sendText = sendUserText;
 (window as any).__playAudioBase64 = playAudioBase64;
+(window as any).__dcSend = (msg: any) => sendDataChannelMessage(msg);
 // Outbound audio diagnostics: is the fake mic actually producing samples and
 // are they leaving over RTP? Used by the harness to tell "audio never flowed"
 // apart from "VAD didn't trigger".
@@ -1388,6 +1412,9 @@ async function playAudioBase64(b64: string): Promise<number> {
     audioCtxTime: state.audioCtx?.currentTime,
   };
   if (!state.pc) return out;
+  out.iceState = state.pc.iceConnectionState;
+  out.connState = state.pc.connectionState;
+  out.dcState = state.dc?.readyState;
   const report = await state.pc.getStats();
   report.forEach((s: any) => {
     if (s.type === "media-source" && s.kind === "audio") {
@@ -1397,6 +1424,19 @@ async function playAudioBase64(b64: string): Promise<number> {
     if (s.type === "outbound-rtp" && s.kind === "audio") {
       out.packetsSent = s.packetsSent;
       out.bytesSent = s.bytesSent;
+    }
+    if (s.type === "inbound-rtp" && s.kind === "audio") {
+      out.packetsReceived = s.packetsReceived;
+    }
+    // The selected ICE pair's STUN counters expose consent freshness health:
+    // requestsSent with no matching responsesReceived → the far side has
+    // stopped answering our consent checks and the browser will kill the call.
+    if (s.type === "candidate-pair" && (s.selected || s.nominated || s.state === "succeeded")) {
+      out.pairState = s.state;
+      out.stunRequestsSent = s.requestsSent;
+      out.stunResponsesReceived = s.responsesReceived;
+      out.stunRequestsReceived = s.requestsReceived;
+      out.lastPacketReceived = s.lastPacketReceivedTimestamp;
     }
   });
   return out;
