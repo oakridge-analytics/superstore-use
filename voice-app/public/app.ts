@@ -877,7 +877,9 @@ async function startSession() {
       state.fakeMicDest = fakeMicDest;
       localStream = fakeMicDest.stream;
     } else {
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
     }
     state.localStream = localStream;
 
@@ -1123,14 +1125,26 @@ function startWsCapture(audioCtx: AudioContext, stream: MediaStream) {
   // The context is created at 24 kHz in WS mode, but a browser may refuse the
   // hint — decimate if so (crude, fine for speech).
   const ratio = audioCtx.sampleRate / 24000;
+  // Half-duplex gate: WebAudio playback is NOT part of the browser's echo-
+  // canceller reference, so on speakerphone the mic hears the assistant's own
+  // voice and server VAD barges in on itself. While assistant audio is
+  // scheduled (plus a short tail for the room to settle), send silence.
+  // Test mode has no acoustic loop (fake mic), so the gate stays off there —
+  // it would only block injected clips.
+  const ECHO_GUARD_S = 0.35;
+  const gateWhileSpeaking = !TEXT_MODE;
   proc.onaudioprocess = (ev) => {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
     const f32 = ev.inputBuffer.getChannelData(0);
     const outLen = Math.floor(f32.length / ratio);
-    const i16 = new Int16Array(outLen);
-    for (let i = 0; i < outLen; i++) {
-      const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)]));
-      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    const i16 = new Int16Array(outLen); // zero-filled = silence
+    const assistantSpeaking =
+      gateWhileSpeaking && audioCtx.currentTime < state.wsPlayCursor + ECHO_GUARD_S;
+    if (!assistantSpeaking) {
+      for (let i = 0; i < outLen; i++) {
+        const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)]));
+        i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
     }
     const bytes = new Uint8Array(i16.buffer);
     let bin = "";
