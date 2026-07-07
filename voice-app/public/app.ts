@@ -26,6 +26,14 @@ const PRICING = {
 // harness-driven turns can take their time.
 const TEXT_MODE = new URLSearchParams(window.location.search).get("text") === "1";
 
+// WebSocket transport fallback: OpenAI's WebRTC server stops sending RTP ~30s
+// after the last assistant audio, and Firefox kills the "dead" transport (ICE
+// consent) — verified with idle-session probes; STUN and dc keepalives don't
+// help. WS is TCP: no ICE, no idle death. Force on any browser with ?ws=1.
+const WS_MODE =
+  /Firefox/i.test(navigator.userAgent) ||
+  new URLSearchParams(window.location.search).get("ws") === "1";
+
 // Orb colors — two states only
 const STATE_COLORS: Record<string, number[]> = {
   active: [0.29, 0.56, 0.96],  // blue
@@ -72,6 +80,12 @@ interface AppState {
   responseCreatedCount: number;
   // Fake mic destination (test mode) — injected audio routes through here
   fakeMicDest: MediaStreamAudioDestinationNode | null;
+  // WebSocket transport (Firefox fallback — see WS_MODE)
+  ws: WebSocket | null;
+  wsPlaybackGain: GainNode | null;
+  wsPlayCursor: number;
+  wsActiveSources: AudioBufferSourceNode[];
+  wsCaptureNodes: AudioNode[];
   // Diagnostics for the e2e harness
   speechStartedCount: number;
   speechStoppedCount: number;
@@ -121,6 +135,11 @@ const state: AppState = {
   toolCallsInFlight: 0,
   responseCreatedCount: 0,
   fakeMicDest: null,
+  ws: null,
+  wsPlaybackGain: null,
+  wsPlayCursor: 0,
+  wsActiveSources: [],
+  wsCaptureNodes: [],
   speechStartedCount: 0,
   speechStoppedCount: 0,
   // Audio analysis
@@ -170,14 +189,6 @@ const costValueEl = costToggle.querySelector(".cost-value") as HTMLSpanElement;
 const textComposer = document.getElementById("text-composer")!;
 const textInput = document.getElementById("text-input") as HTMLInputElement;
 const textSend = document.getElementById("text-send") as HTMLButtonElement;
-
-// Firefox can't hold a Realtime WebRTC call open: OpenAI's server stops
-// sending RTP ~30s after the last assistant audio, Firefox reads that as a
-// dead transport (ICE consent) and terminates — verified with idle-session
-// probes; Chromium tolerates the same gap. Warn until we ship a WS fallback.
-if (/Firefox/i.test(navigator.userAgent)) {
-  document.getElementById("browser-note")?.removeAttribute("hidden");
-}
 
 // ─── Event Listeners ───
 startBtn.addEventListener("click", startSession);
@@ -798,7 +809,11 @@ async function startSession() {
     startOrbLoop();
 
     // Create AudioContext (user gesture required — we're in a click handler)
-    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // WS transport talks raw PCM16 at 24kHz both ways — run the whole audio
+    // graph at that rate so capture needs no resampling.
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)(
+      WS_MODE ? { sampleRate: 24000 } : undefined,
+    );
     if (audioCtx.state === "suspended") {
       await audioCtx.resume();
     }
@@ -808,28 +823,31 @@ async function startSession() {
     state.analyser = analyser;
     state.analyserData = new Uint8Array(analyser.frequencyBinCount);
 
-    // Create audio element for remote audio playback.
-    const audioEl = document.createElement("audio");
-    audioEl.autoplay = true;
-    audioEl.style.display = "none";
-    document.body.appendChild(audioEl);
-    state.audioEl = audioEl;
-
-    // Firefox silences an <audio> element captured by createMediaElementSource
-    // when a WebRTC srcObject is assigned (cross-origin restriction). Chrome,
-    // conversely, gives silence when using createMediaStreamSource on WebRTC
-    // streams. So we pick the strategy that works per engine.
+    // Create audio element for remote audio playback (WebRTC only — the WS
+    // transport schedules PCM chunks through WebAudio instead).
+    let audioEl: HTMLAudioElement | null = null;
     const isFirefox = /Firefox/i.test(navigator.userAgent);
+    if (!WS_MODE) {
+      audioEl = document.createElement("audio");
+      audioEl.autoplay = true;
+      audioEl.style.display = "none";
+      document.body.appendChild(audioEl);
+      state.audioEl = audioEl;
 
-    if (!isFirefox) {
-      // Chrome / Safari: capture audio element → analyser → destination.
-      const mediaSource = audioCtx.createMediaElementSource(audioEl);
-      mediaSource.connect(analyser);
-      analyser.connect(audioCtx.destination);
-      state.remoteSource = mediaSource;
+      // Firefox silences an <audio> element captured by createMediaElementSource
+      // when a WebRTC srcObject is assigned (cross-origin restriction). Chrome,
+      // conversely, gives silence when using createMediaStreamSource on WebRTC
+      // streams. So we pick the strategy that works per engine.
+      if (!isFirefox) {
+        // Chrome / Safari: capture audio element → analyser → destination.
+        const mediaSource = audioCtx.createMediaElementSource(audioEl);
+        mediaSource.connect(analyser);
+        analyser.connect(audioCtx.destination);
+        state.remoteSource = mediaSource;
+      }
+      // Firefox path: audio element plays normally; createMediaStreamSource
+      // is wired up in pc.ontrack once the remote stream is available.
     }
-    // Firefox path: audio element plays normally; createMediaStreamSource
-    // is wired up in pc.ontrack once the remote stream is available.
 
     console.log("Requesting ephemeral token...");
     const voiceToken = document.querySelector<HTMLMetaElement>('meta[name="voice-token"]')?.content || "";
@@ -842,38 +860,6 @@ async function startSession() {
     // fall back to the beta client_secret.value shape for safety.
     const ephemeralKey = tokenData.value ?? tokenData.client_secret?.value;
     if (!ephemeralKey) throw new Error("No ephemeral key in token response");
-
-    // STUN matters: without it Firefox's ICE consent-freshness checks fail
-    // ~35s into the call (even with RTP flowing) and the session silently
-    // dies mid-conversation. Chromium happens to survive host-only ICE.
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-      ],
-    });
-    state.pc = pc;
-
-    // When remote audio track arrives, attach to audio element.
-    pc.ontrack = (ev) => {
-      audioEl.srcObject = ev.streams[0];
-      // Ensure playback starts (Firefox may block autoplay if user gesture expired)
-      audioEl.play().catch(() => { });
-      console.log("Remote audio track received");
-
-      // Firefox: wire the WebRTC stream directly to the analyser via
-      // createMediaStreamSource. Don't connect to destination — the
-      // <audio> element handles audible playback on its own.
-      if (isFirefox && state.audioCtx && state.analyser && !state.remoteSource) {
-        try {
-          const source = state.audioCtx.createMediaStreamSource(ev.streams[0]);
-          source.connect(state.analyser);
-          state.remoteSource = source;
-          console.log("Audio analysis via createMediaStreamSource (Firefox)");
-        } catch (e: any) {
-          console.error("createMediaStreamSource failed: " + e.message);
-        }
-      }
-    };
 
     let localStream: MediaStream;
     if (TEXT_MODE) {
@@ -894,36 +880,50 @@ async function startSession() {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     }
     state.localStream = localStream;
+
+    if (WS_MODE) {
+      await startWsTransport(ephemeralKey, localStream);
+      return;
+    }
+
+    // STUN matters: without it Firefox's ICE consent-freshness checks fail
+    // ~35s into the call (even with RTP flowing) and the session silently
+    // dies mid-conversation. Chromium happens to survive host-only ICE.
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+      ],
+    });
+    state.pc = pc;
+
+    // When remote audio track arrives, attach to audio element.
+    pc.ontrack = (ev) => {
+      audioEl!.srcObject = ev.streams[0];
+      // Ensure playback starts (Firefox may block autoplay if user gesture expired)
+      audioEl!.play().catch(() => { });
+      console.log("Remote audio track received");
+
+      // Firefox: wire the WebRTC stream directly to the analyser via
+      // createMediaStreamSource. Don't connect to destination — the
+      // <audio> element handles audible playback on its own.
+      if (isFirefox && state.audioCtx && state.analyser && !state.remoteSource) {
+        try {
+          const source = state.audioCtx.createMediaStreamSource(ev.streams[0]);
+          source.connect(state.analyser);
+          state.remoteSource = source;
+          console.log("Audio analysis via createMediaStreamSource (Firefox)");
+        } catch (e: any) {
+          console.error("createMediaStreamSource failed: " + e.message);
+        }
+      }
+    };
+
     localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
 
     const dc = pc.createDataChannel("oai-events");
     state.dc = dc;
 
-    dc.onopen = () => {
-      console.log("Data channel open, WebRTC connected");
-      setStatus("listening");
-      resetInactivityTimer();
-      if (TEXT_MODE) {
-        textComposer.classList.add("active");
-      }
-      // Start max session duration timer
-      state.sessionTimer = setTimeout(() => {
-        console.log("Max session duration reached — ending session");
-        addMessage("system", "Session ended — maximum duration reached.");
-        setCaption("Session ended — maximum duration reached.", "system");
-        endSession();
-      }, MAX_SESSION_DURATION_MS);
-      // Prompt the agent to greet the user and explain what it can do
-      sendDataChannelMessage({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "system",
-          content: [{ type: "input_text", text: "Greet the user warmly. Briefly tell them you can help come up with recipe ideas and manage their grocery cart. Then ask where they're located so you can find the nearest store." }],
-        },
-      });
-      requestResponse();
-    };
+    dc.onopen = () => onTransportOpen("Data channel (WebRTC)");
 
     dc.onclose = () => {
       state.awaitingAudioDrain = false;
@@ -990,6 +990,18 @@ function endSession() {
     state.pc = null;
   }
   state.dc = null;
+  // Close WebSocket transport
+  if (state.ws) {
+    state.ws.onclose = null;
+    try { state.ws.close(); } catch (_) { }
+    state.ws = null;
+  }
+  flushWsPlayback();
+  for (const node of state.wsCaptureNodes) {
+    try { node.disconnect(); } catch (_) { }
+  }
+  state.wsCaptureNodes = [];
+  state.wsPlaybackGain = null;
   state.awaitingAudioDrain = false;
   state.responseActive = false;
   state.pendingResponse = false;
@@ -1030,6 +1042,141 @@ function endSession() {
   }, 2000);
 }
 
+// Shared by both transports once the event channel is live.
+function onTransportOpen(label: string) {
+  console.log(label + " open — session live");
+  setStatus("listening");
+  resetInactivityTimer();
+  if (TEXT_MODE) {
+    textComposer.classList.add("active");
+  }
+  // Start max session duration timer
+  state.sessionTimer = setTimeout(() => {
+    console.log("Max session duration reached — ending session");
+    addMessage("system", "Session ended — maximum duration reached.");
+    setCaption("Session ended — maximum duration reached.", "system");
+    endSession();
+  }, MAX_SESSION_DURATION_MS);
+  // Prompt the agent to greet the user and explain what it can do
+  sendDataChannelMessage({
+    type: "conversation.item.create",
+    item: {
+      type: "message",
+      role: "system",
+      content: [{ type: "input_text", text: "Greet the user warmly in English (switch languages later only if the user does). Briefly tell them you can help come up with recipe ideas and manage their grocery cart. Then ask where they're located so you can find the nearest store." }],
+    },
+  });
+  requestResponse();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// WebSocket Transport (Firefox fallback — see WS_MODE)
+// Same Realtime event protocol as the WebRTC data channel, but audio moves
+// as base64 PCM16 @ 24 kHz events instead of RTP.
+// ═══════════════════════════════════════════════════════════════
+
+async function startWsTransport(ephemeralKey: string, localStream: MediaStream): Promise<void> {
+  const audioCtx = state.audioCtx!;
+  const analyser = state.analyser!;
+  // Playback chain: PCM chunks → gain → analyser (orb reactivity) → speakers.
+  const playbackGain = audioCtx.createGain();
+  playbackGain.connect(analyser);
+  analyser.connect(audioCtx.destination);
+  state.wsPlaybackGain = playbackGain;
+  state.wsPlayCursor = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    // Browsers can't set an Authorization header on WebSockets; the ephemeral
+    // key rides in the subprotocol list instead. Session config (tools, VAD,
+    // voice) is already bound to the key from /client_secrets.
+    const ws = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
+      ["realtime", `openai-insecure-api-key.${ephemeralKey}`],
+    );
+    state.ws = ws;
+    ws.onopen = () => {
+      startWsCapture(audioCtx, localStream);
+      onTransportOpen("WebSocket");
+      resolve();
+    };
+    ws.onmessage = (ev) => handleServerEvent(JSON.parse(ev.data));
+    ws.onerror = () => reject(new Error("WebSocket connection failed"));
+    ws.onclose = (ev) => {
+      console.log(`WebSocket closed: ${ev.code} ${ev.reason || ""}`);
+      state.awaitingAudioDrain = false;
+      setStatus("disconnected");
+    };
+  });
+}
+
+function startWsCapture(audioCtx: AudioContext, stream: MediaStream) {
+  const source = audioCtx.createMediaStreamSource(stream);
+  // ScriptProcessor is deprecated but universal; 4096 frames ≈ 170 ms @ 24 kHz.
+  const proc = audioCtx.createScriptProcessor(4096, 1, 1);
+  // The processor only ticks when connected through to the destination —
+  // route via a zero-gain node so the mic is never audible locally.
+  const mute = audioCtx.createGain();
+  mute.gain.value = 0;
+  source.connect(proc);
+  proc.connect(mute);
+  mute.connect(audioCtx.destination);
+  // The context is created at 24 kHz in WS mode, but a browser may refuse the
+  // hint — decimate if so (crude, fine for speech).
+  const ratio = audioCtx.sampleRate / 24000;
+  proc.onaudioprocess = (ev) => {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const f32 = ev.inputBuffer.getChannelData(0);
+    const outLen = Math.floor(f32.length / ratio);
+    const i16 = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const s = Math.max(-1, Math.min(1, f32[Math.floor(i * ratio)]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    const bytes = new Uint8Array(i16.buffer);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, Math.min(i + 0x8000, bytes.length)));
+    }
+    state.ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: btoa(bin) }));
+  };
+  state.wsCaptureNodes = [source, proc, mute];
+}
+
+function wsPlayAudioDelta(b64: string) {
+  const audioCtx = state.audioCtx;
+  const gain = state.wsPlaybackGain;
+  if (!audioCtx || !gain) return;
+  const raw = atob(b64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const i16 = new Int16Array(bytes.buffer, 0, Math.floor(bytes.length / 2));
+  const buf = audioCtx.createBuffer(1, i16.length, 24000);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < i16.length; i++) ch[i] = i16[i] / 32768;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(gain);
+  // Schedule chunks back-to-back on the context clock for gapless speech.
+  const startAt = Math.max(state.wsPlayCursor, audioCtx.currentTime + 0.05);
+  src.start(startAt);
+  state.wsPlayCursor = startAt + buf.duration;
+  state.wsActiveSources.push(src);
+  src.onended = () => {
+    const idx = state.wsActiveSources.indexOf(src);
+    if (idx >= 0) state.wsActiveSources.splice(idx, 1);
+  };
+}
+
+// Barge-in: dump any queued assistant audio (WebRTC handles this server-side;
+// over WS the queue is ours to flush).
+function flushWsPlayback() {
+  for (const src of state.wsActiveSources) {
+    try { src.stop(); } catch (_) { }
+  }
+  state.wsActiveSources = [];
+  state.wsPlayCursor = 0;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Server Event Handling
 // ═══════════════════════════════════════════════════════════════
@@ -1041,6 +1188,13 @@ function handleServerEvent(event: any) {
     case "response.created":
       state.responseActive = true;
       state.responseCreatedCount++;
+      break;
+
+    // WS transport: assistant audio arrives as base64 PCM16 events (the
+    // WebRTC transport streams it as RTP and never emits these).
+    case "response.audio.delta":
+    case "response.output_audio.delta":
+      if (event.delta) wsPlayAudioDelta(event.delta);
       break;
 
     // GA renamed these with an `output_` prefix; handle both beta and GA names.
@@ -1074,6 +1228,7 @@ function handleServerEvent(event: any) {
       state.inactivityNudged = false; // real user input resets the nudge stage
       clearInactivityTimer();
       state.awaitingAudioDrain = false;
+      flushWsPlayback();
       clearCaption();
       break;
 
@@ -1312,11 +1467,20 @@ async function callBackend(fnName: string, args: any): Promise<any> {
   return res.json();
 }
 
+function transportOpen(): boolean {
+  return (
+    (!!state.ws && state.ws.readyState === WebSocket.OPEN) ||
+    (!!state.dc && state.dc.readyState === "open")
+  );
+}
+
 function sendDataChannelMessage(msg: any) {
-  if (state.dc && state.dc.readyState === "open") {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    state.ws.send(JSON.stringify(msg));
+  } else if (state.dc && state.dc.readyState === "open") {
     state.dc.send(JSON.stringify(msg));
   } else {
-    console.warn("Data channel not open, cannot send:", msg);
+    console.warn("Transport not open, cannot send:", msg);
   }
 }
 
@@ -1339,7 +1503,7 @@ function requestResponse() {
     if (
       state.responseCreatedCount === seenResponses &&
       state.responseActive &&
-      state.dc?.readyState === "open"
+      transportOpen()
     ) {
       console.warn("response.create unacknowledged after 4s — retrying");
       state.responseActive = false;
@@ -1390,7 +1554,8 @@ async function playAudioBase64(b64: string): Promise<number> {
 
 // Harness hooks — used by scripts/voice_e2e.py via Playwright.
 (window as any).__voiceStatus = () => ({
-  dcOpen: !!state.dc && state.dc.readyState === "open",
+  dcOpen: transportOpen(),
+  transport: state.ws ? "websocket" : state.pc ? "webrtc" : null,
   status: state.currentStatus,
   responseActive: state.responseActive,
   pendingResponse: state.pendingResponse,

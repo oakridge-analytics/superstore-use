@@ -195,6 +195,8 @@ def main() -> int:
     parser.add_argument("--url", default=DEFAULT_URL, help="Voice app base URL")
     parser.add_argument("--headed", action="store_true", help="Show the browser")
     parser.add_argument("--browser", default="chromium", choices=["chromium", "firefox", "webkit"])
+    parser.add_argument("--ws", action="store_true",
+                        help="Force the WebSocket transport (?ws=1; Firefox uses it automatically)")
     args = parser.parse_args()
 
     if args.script:
@@ -227,8 +229,9 @@ def main() -> int:
             lambda msg: msg.type in ("error", "warning") and print(f"      [console] {msg.text[:200]}"),
         )
 
-        print(f"[0/{total}] open {args.url}/?text=1 and start session")
-        page.goto(f"{args.url}/?text=1")
+        query = "?text=1" + ("&ws=1" if args.ws else "")
+        print(f"[0/{total}] open {args.url}/{query} and start session")
+        page.goto(f"{args.url}/{query}")
         page.click("#start-btn")
         page.wait_for_selector("#text-composer.active", timeout=45_000)
         print("      -> Realtime data channel open (test mode)")
