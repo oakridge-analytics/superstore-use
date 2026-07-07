@@ -52,6 +52,12 @@ uv run modal app logs superstore-agent          # Stream logs
 # MCP server (manual deploy — not in CI)
 uv run modal deploy mcp-server/modal_app.py
 
+# Voice app tests (against the deployed app)
+uv run python scripts/voice_smoke_api.py        # backend → MCP → PCX chain
+uv run python scripts/voice_e2e.py              # full journey, typed text in
+uv run python scripts/voice_e2e.py --mode audio # same journey, TTS audio in (needs OPENAI_API_KEY)
+uv run python scripts/voice_e2e.py "utterance 1" "utterance 2" ...  # custom conversation
+
 # Local CLI (browser agent)
 uv run -m src.local.cli login                   # Save browser profile
 uv run -m src.local.cli shop                    # Interactive shopping

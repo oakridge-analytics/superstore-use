@@ -20,6 +20,12 @@ const PRICING = {
   audioOutput: 64.00 / 1_000_000,
 };
 
+// Test/text mode (?text=1): no mic — a fake silent audio track keeps the GA
+// WebRTC audio m-line alive, input arrives via the text composer or injected
+// audio (window.__playAudioBase64), and the inactivity self-destruct is off so
+// harness-driven turns can take their time.
+const TEXT_MODE = new URLSearchParams(window.location.search).get("text") === "1";
+
 // Orb colors — two states only
 const STATE_COLORS: Record<string, number[]> = {
   active: [0.29, 0.56, 0.96],  // blue
@@ -55,6 +61,20 @@ interface AppState {
   currentResponseId: string | null;
   productNames: Record<string, string>;
   productSizes: Record<string, string>;
+  // Response/tool-call serialization: response.create must never fire while
+  // another response is active or a tool result is still pending, or the
+  // server rejects it and the session wedges after the first tool call.
+  responseActive: boolean;
+  pendingResponse: boolean;
+  toolCallsInFlight: number;
+  // Bumped on every response.created — lets requestResponse detect that its
+  // response.create was silently rejected (raced a VAD-triggered response).
+  responseCreatedCount: number;
+  // Fake mic destination (test mode) — injected audio routes through here
+  fakeMicDest: MediaStreamAudioDestinationNode | null;
+  // Diagnostics for the e2e harness
+  speechStartedCount: number;
+  speechStoppedCount: number;
   // Audio analysis
   audioCtx: AudioContext | null;
   analyser: AnalyserNode | null;
@@ -72,8 +92,9 @@ interface AppState {
   breathMix: number;
   // Caption
   captionTimeout: ReturnType<typeof setTimeout> | null;
-  // Inactivity auto-shutdown (30s)
+  // Inactivity auto-shutdown
   inactivityTimer: ReturnType<typeof setTimeout> | null;
+  inactivityNudged: boolean;
   // Max session duration timer
   sessionTimer: ReturnType<typeof setTimeout> | null;
   // Transcript
@@ -95,6 +116,13 @@ const state: AppState = {
   currentResponseId: null,
   productNames: {},
   productSizes: {},
+  responseActive: false,
+  pendingResponse: false,
+  toolCallsInFlight: 0,
+  responseCreatedCount: 0,
+  fakeMicDest: null,
+  speechStartedCount: 0,
+  speechStoppedCount: 0,
   // Audio analysis
   audioCtx: null,
   analyser: null,
@@ -114,6 +142,7 @@ const state: AppState = {
   captionTimeout: null,
   // Inactivity auto-shutdown
   inactivityTimer: null,
+  inactivityNudged: false,
   // Max session duration
   sessionTimer: null,
   // Transcript
@@ -138,6 +167,9 @@ const transcript = document.getElementById("transcript")!;
 const stopBtn = document.getElementById("stop-btn") as HTMLButtonElement;
 const costToggle = document.getElementById("cost-toggle")!;
 const costValueEl = costToggle.querySelector(".cost-value") as HTMLSpanElement;
+const textComposer = document.getElementById("text-composer")!;
+const textInput = document.getElementById("text-input") as HTMLInputElement;
+const textSend = document.getElementById("text-send") as HTMLButtonElement;
 
 // ─── Event Listeners ───
 startBtn.addEventListener("click", startSession);
@@ -146,6 +178,16 @@ transcriptToggle.addEventListener("click", toggleTranscript);
 costToggle.addEventListener("click", () => costToggle.classList.toggle("expanded"));
 cartItems.addEventListener("scroll", () => {
   cartItems.classList.toggle("scrolled", cartItems.scrollTop > 0);
+});
+textSend.addEventListener("click", () => {
+  sendUserText(textInput.value);
+  textInput.value = "";
+});
+textInput.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    sendUserText(textInput.value);
+    textInput.value = "";
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -527,11 +569,34 @@ const MAX_SESSION_DURATION_MS = 15 * 60 * 1_000; // 15 minutes hard limit
 const MAX_SESSION_COST_USD = 2.00; // $2 cost ceiling per session
 
 // ─── Inactivity Auto-Shutdown ───
-const INACTIVITY_TIMEOUT_MS = 30_000;
+// Two-stage: after the first quiet stretch the assistant checks in verbally;
+// only a second full stretch ends the session. 30s hard-kill fired during
+// normal "what else do I need?" shopping pauses.
+const INACTIVITY_TIMEOUT_MS = 120_000;
 
 function resetInactivityTimer() {
+  if (TEXT_MODE) return; // harness-driven sessions must not self-destruct
+  if (state.toolCallsInFlight > 0) return; // a slow tool call is not inactivity
   if (state.inactivityTimer) clearTimeout(state.inactivityTimer);
   state.inactivityTimer = setTimeout(() => {
+    if (!state.inactivityNudged) {
+      state.inactivityNudged = true;
+      console.log("Inactivity — nudging user");
+      sendDataChannelMessage({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "system",
+          content: [{
+            type: "input_text",
+            text: "The user has been quiet for a while. Briefly check in — ask if they'd like anything else or if you should wrap up.",
+          }],
+        },
+      });
+      requestResponse();
+      resetInactivityTimer(); // a second silent stretch ends the session
+      return;
+    }
     console.log("Inactivity timeout — ending session");
     addMessage("system", "Session ended due to inactivity.");
     setCaption("Session ended due to inactivity.", "system");
@@ -795,7 +860,24 @@ async function startSession() {
       }
     };
 
-    const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    let localStream: MediaStream;
+    if (TEXT_MODE) {
+      // Fake mic: injected test audio (window.__playAudioBase64) plays into
+      // this node like mic speech. The constant near-zero source matters: an
+      // idle MediaStreamDestination emits NO frames (zero RTP packets), so
+      // after a clip ends the server never hears the trailing silence that
+      // closes a VAD turn — it just sees the stream stall mid-speech. A live
+      // silent source keeps real silence flowing.
+      const fakeMicDest = audioCtx.createMediaStreamDestination();
+      const keepAlive = audioCtx.createConstantSource();
+      keepAlive.offset.value = 1e-5;
+      keepAlive.connect(fakeMicDest);
+      keepAlive.start();
+      state.fakeMicDest = fakeMicDest;
+      localStream = fakeMicDest.stream;
+    } else {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
     state.localStream = localStream;
     localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
 
@@ -806,6 +888,9 @@ async function startSession() {
       console.log("Data channel open, WebRTC connected");
       setStatus("listening");
       resetInactivityTimer();
+      if (TEXT_MODE) {
+        textComposer.classList.add("active");
+      }
       // Start max session duration timer
       state.sessionTimer = setTimeout(() => {
         console.log("Max session duration reached — ending session");
@@ -822,7 +907,7 @@ async function startSession() {
           content: [{ type: "input_text", text: "Greet the user warmly. Briefly tell them you can help come up with recipe ideas and manage their grocery cart. Then ask where they're located so you can find the nearest store." }],
         },
       });
-      sendDataChannelMessage({ type: "response.create" });
+      requestResponse();
     };
 
     dc.onclose = () => {
@@ -883,6 +968,12 @@ function endSession() {
   }
   state.dc = null;
   state.awaitingAudioDrain = false;
+  state.responseActive = false;
+  state.pendingResponse = false;
+  state.toolCallsInFlight = 0;
+  state.inactivityNudged = false;
+  state.fakeMicDest = null;
+  textComposer.classList.remove("active");
   // Release audio
   if (state.audioEl) {
     state.audioEl.srcObject = null;
@@ -924,6 +1015,11 @@ let currentMsgEl: HTMLElement | null = null;
 
 function handleServerEvent(event: any) {
   switch (event.type) {
+    case "response.created":
+      state.responseActive = true;
+      state.responseCreatedCount++;
+      break;
+
     // GA renamed these with an `output_` prefix; handle both beta and GA names.
     case "response.audio_transcript.delta":
     case "response.output_audio_transcript.delta":
@@ -951,12 +1047,15 @@ function handleServerEvent(event: any) {
       break;
 
     case "input_audio_buffer.speech_started":
+      state.speechStartedCount++;
+      state.inactivityNudged = false; // real user input resets the nudge stage
       clearInactivityTimer();
       state.awaitingAudioDrain = false;
       clearCaption();
       break;
 
     case "input_audio_buffer.speech_stopped":
+      state.speechStoppedCount++;
       resetInactivityTimer();
       break;
 
@@ -987,18 +1086,17 @@ function handleServerEvent(event: any) {
       break;
 
     case "response.done":
-      if (event.response?.output) {
-        for (const item of event.response.output) {
-          if (item.type === "function_call" && item.status === "completed") {
-            // Already handled by function_call_arguments.done
-          }
-        }
-      }
+      state.responseActive = false;
       // Accumulate cost from usage
       if (event.response?.usage) {
         const cost = calculateUsageCost(event.response.usage);
         state.sessionCost += cost;
         updateCostDisplay();
+      }
+      // Flush a response request that was queued while this one was active
+      // (e.g. a tool result landed mid-response).
+      if (state.pendingResponse && state.toolCallsInFlight === 0) {
+        requestResponse();
       }
       if (!currentMsgEl && !state.awaitingAudioDrain) {
         setStatus("listening");
@@ -1006,11 +1104,21 @@ function handleServerEvent(event: any) {
       }
       break;
 
-    case "error":
-      console.error("Realtime error:", event.error);
-      addMessage("system", "Error: " + (event.error?.message || "Unknown error"));
-      setCaption("Error: " + (event.error?.message || "Unknown"), "system");
+    case "error": {
+      const err = event.error || {};
+      console.error("Realtime error: " + JSON.stringify(err));
+      const errText = `${err.code || ""} ${err.message || ""}`;
+      if (errText.includes("active response")) {
+        // Our response.create raced a VAD-triggered response and was
+        // rejected. Recoverable: retry once the active response finishes
+        // (flushed by the response.done handler). Don't surface to the user.
+        state.pendingResponse = true;
+      } else {
+        addMessage("system", "Error: " + (err.message || "Unknown error"));
+        setCaption("Error: " + (err.message || "Unknown"), "system");
+      }
       break;
+    }
   }
 }
 
@@ -1027,7 +1135,36 @@ async function handleToolCall(event: any) {
     args = {};
   }
 
+  state.toolCallsInFlight++;
   console.log(`Tool call: ${name}(${argsStr})`);
+  let result: any;
+  try {
+    result = await runToolCall(name, args);
+  } catch (err: any) {
+    // UI/post-processing failures must never strand the model without a tool
+    // result — an unanswered function call reads as permanent silence.
+    console.error("Tool call handler failed: " + (err?.message || err));
+    result = { error: String(err?.message || err) };
+  }
+
+  // Strip cart_url so the voice agent never sees raw URLs to read aloud.
+  // The frontend already captured cart_url for UI use in runToolCall.
+  const sanitizedResult = { ...result };
+  delete sanitizedResult.cart_url;
+
+  sendDataChannelMessage({
+    type: "conversation.item.create",
+    item: {
+      type: "function_call_output",
+      call_id,
+      output: JSON.stringify(sanitizedResult),
+    },
+  });
+  state.toolCallsInFlight = Math.max(0, state.toolCallsInFlight - 1);
+  requestResponse();
+}
+
+async function runToolCall(name: string, args: any): Promise<any> {
   const label = name.replace(/_/g, " ");
   const capLabel = label.charAt(0).toUpperCase() + label.slice(1);
   addMessage("system", `${capLabel}...`);
@@ -1112,22 +1249,7 @@ async function handleToolCall(event: any) {
     }, delay);
   }
 
-  // Strip cart_url so the voice agent never sees raw URLs to read aloud.
-  // The frontend already captured cart_url for UI use above.
-  const sanitizedResult = { ...result };
-  delete sanitizedResult.cart_url;
-
-  sendDataChannelMessage({
-    type: "conversation.item.create",
-    item: {
-      type: "function_call_output",
-      call_id,
-      output: JSON.stringify(sanitizedResult),
-    },
-  });
-  sendDataChannelMessage({
-    type: "response.create",
-  });
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1156,6 +1278,9 @@ async function callBackend(fnName: string, args: any): Promise<any> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    // A hung backend call must resolve into a tool error the model can speak
+    // about, not hold the conversation hostage.
+    signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -1171,3 +1296,108 @@ function sendDataChannelMessage(msg: any) {
     console.warn("Data channel not open, cannot send:", msg);
   }
 }
+
+// Serialized response.create: the Realtime API rejects a response.create
+// while another response is active, and dropping that error wedges the
+// session. Queue instead and flush from the response.done handler.
+function requestResponse() {
+  if (state.responseActive || state.toolCallsInFlight > 0) {
+    state.pendingResponse = true;
+    return;
+  }
+  state.pendingResponse = false;
+  state.responseActive = true; // optimistic; response.created confirms
+  const seenResponses = state.responseCreatedCount;
+  sendDataChannelMessage({ type: "response.create" });
+  // Watchdog: if no response.created arrives (our create raced a
+  // VAD-triggered response and was rejected, or got lost), release the
+  // optimistic lock and retry — otherwise the session stays silent forever.
+  setTimeout(() => {
+    if (
+      state.responseCreatedCount === seenResponses &&
+      state.responseActive &&
+      state.dc?.readyState === "open"
+    ) {
+      console.warn("response.create unacknowledged after 4s — retrying");
+      state.responseActive = false;
+      state.pendingResponse = true;
+      if (state.toolCallsInFlight === 0) requestResponse();
+    }
+  }, 4000);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test-mode input (?text=1): typed text or injected audio
+// ═══════════════════════════════════════════════════════════════
+
+function sendUserText(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  state.inactivityNudged = false;
+  addMessage("user", trimmed);
+  setCaption(trimmed, "user");
+  sendDataChannelMessage({
+    type: "conversation.item.create",
+    item: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: trimmed }],
+    },
+  });
+  requestResponse();
+}
+
+// Decode a base64 audio file (WAV/anything decodeAudioData accepts) and play
+// it into the fake mic track so server VAD hears it exactly like mic speech.
+// Returns the clip duration in seconds so callers can pace themselves.
+async function playAudioBase64(b64: string): Promise<number> {
+  if (!state.audioCtx || !state.fakeMicDest) {
+    throw new Error("No fake mic — start a session with ?text=1 first");
+  }
+  const raw = atob(b64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const buffer = await state.audioCtx.decodeAudioData(bytes.buffer);
+  const source = state.audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(state.fakeMicDest);
+  source.start();
+  return buffer.duration;
+}
+
+// Harness hooks — used by scripts/voice_e2e.py via Playwright.
+(window as any).__voiceStatus = () => ({
+  dcOpen: !!state.dc && state.dc.readyState === "open",
+  status: state.currentStatus,
+  responseActive: state.responseActive,
+  pendingResponse: state.pendingResponse,
+  toolCallsInFlight: state.toolCallsInFlight,
+  cartId: state.cart_id,
+  sessionCost: state.sessionCost,
+  speechStartedCount: state.speechStartedCount,
+  speechStoppedCount: state.speechStoppedCount,
+});
+(window as any).__sendText = sendUserText;
+(window as any).__playAudioBase64 = playAudioBase64;
+// Outbound audio diagnostics: is the fake mic actually producing samples and
+// are they leaving over RTP? Used by the harness to tell "audio never flowed"
+// apart from "VAD didn't trigger".
+(window as any).__rtcStats = async () => {
+  const out: any = {
+    audioCtxState: state.audioCtx?.state,
+    audioCtxTime: state.audioCtx?.currentTime,
+  };
+  if (!state.pc) return out;
+  const report = await state.pc.getStats();
+  report.forEach((s: any) => {
+    if (s.type === "media-source" && s.kind === "audio") {
+      out.audioLevel = s.audioLevel;
+      out.totalAudioEnergy = s.totalAudioEnergy;
+    }
+    if (s.type === "outbound-rtp" && s.kind === "audio") {
+      out.packetsSent = s.packetsSent;
+      out.bytesSent = s.bytesSent;
+    }
+  });
+  return out;
+};
