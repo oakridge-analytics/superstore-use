@@ -1,8 +1,15 @@
+"""Voice shopping backend (FastAPI on Modal).
+
+Serves the WebRTC voice frontend, mints OpenAI Realtime ephemeral keys, and
+proxies every shopping tool call to the superstore MCP server — all PC Express
+and Mapbox logic (including the residential-proxy WAF workaround) lives there.
+"""
+
 import modal
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("fastapi", "httpx")
+    .pip_install("fastapi", "httpx", "fastmcp>=2.3")
     .add_local_dir("./voice-app/public", remote_path="/app/public")
 )
 
@@ -10,41 +17,7 @@ app = modal.App("voice-shopping")
 
 usage_stats = modal.Dict.from_name("voice-usage-stats", create_if_missing=True)
 
-PCX_BASE = "https://api.pcexpress.ca/pcx-bff/api/v1"
-PCX_BASE_HEADERS = {
-    "x-apikey": "C1xujSegT5j3ap3yexJjqhOfELwGKYvz",
-    "x-loblaw-tenant-id": "ONLINE_GROCERIES",
-    "x-channel": "web",
-    "x-application-type": "web",
-    "business-user-agent": "PCXWEB",
-    "accept-language": "en",
-    "content-type": "application/json",
-}
-
-BANNERS = {
-    "superstore": {
-        "name": "Real Canadian Superstore",
-        "cart_url": "https://www.realcanadiansuperstore.ca/en/cartReview",
-    },
-    "nofrills": {"name": "No Frills", "cart_url": "https://www.nofrills.ca/en/cartReview"},
-    "loblaw": {"name": "Loblaws", "cart_url": "https://www.loblaws.ca/en/cartReview"},
-    "independent": {
-        "name": "Your Independent Grocer",
-        "cart_url": "https://www.yourindependentgrocer.ca/en/cartReview",
-    },
-    "zehrs": {"name": "Zehrs", "cart_url": "https://www.zehrs.ca/en/cartReview"},
-    "fortinos": {"name": "Fortinos", "cart_url": "https://www.fortinos.ca/en/cartReview"},
-    "maxi": {"name": "Maxi", "cart_url": "https://www.maxi.ca/en/cartReview"},
-    "provigo": {"name": "Provigo", "cart_url": "https://www.provigo.ca/en/cartReview"},
-    "dominion": {"name": "Dominion", "cart_url": "https://www.dominion.ca/en/cartReview"},
-    "wholesaleclub": {"name": "Wholesale Club", "cart_url": "https://www.wholesaleclub.ca/en/cartReview"},
-    "valumart": {"name": "Valu-Mart", "cart_url": "https://www.valumart.ca/en/cartReview"},
-    "extrafoods": {"name": "Extra Foods", "cart_url": "https://www.extrafoods.ca/en/cartReview"},
-}
-
-
-def pcx_headers(banner: str = "superstore") -> dict:
-    return {**PCX_BASE_HEADERS, "basesiteid": banner, "site-banner": banner}
+DEFAULT_MCP_URL = "https://dbandrews--superstore-mcp-mcp-server.modal.run/mcp"
 
 
 SYSTEM_PROMPT = """\
@@ -101,6 +74,7 @@ Do NOT guess the sold_by type from the product name or code — always use the v
 
 # IMPORTANT RULES
 
+- Before calling any tool, say a very short filler phrase first (e.g. "One sec — checking.", "Let me look that up.") so the user never hears dead air while the tool runs. Vary the phrasing.
 - IF the user asks about anything unrelated to groceries or food IMMEDIATELY call `finish_shopping` with `reason: "off_topic"`.
 - When the user says they're done shopping, call `finish_shopping` and say a quick goodbye.
 """
@@ -216,45 +190,21 @@ TOOLS = [
 def create_web_app():
     import hashlib
     import json
-    import math
     import os
-    import re
     import uuid
     from datetime import datetime, timezone
-    from urllib.parse import quote
 
     import httpx
     from fastapi import FastAPI, Request
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
+    from fastmcp import Client
     from starlette.middleware.base import BaseHTTPMiddleware
 
     web_app = FastAPI()
 
-    def _pcx_proxy() -> str | None:
-        """Build the Oxylabs proxy URL for PCX/Mapbox calls.
-
-        PC Express's WAF returns 403 to Modal's datacenter egress IPs, which
-        silently forces the static fallback store list and breaks carts.
-        Routing through the residential proxy restores live API access.
-        Returns None if proxy creds aren't configured (callers go direct).
-        """
-        server = os.environ.get("PROXY_SERVER")
-        user = os.environ.get("PROXY_USERNAME")
-        pw = os.environ.get("PROXY_PASSWORD")
-        if not all([server, user, pw]):
-            print("[proxy] oxy-proxy creds missing — PCX/Mapbox calls will likely 403")
-            return None
-        hostport = re.sub(r"^https?://", "", server).rstrip("/")
-        return f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{hostport}"
-
-    def _client() -> httpx.AsyncClient:
-        """httpx client routed through the residential proxy for PCX/Mapbox.
-
-        Use for every api.pcexpress.ca / api.mapbox.com call. OpenAI calls
-        must stay direct (they'd break through a residential exit).
-        """
-        return httpx.AsyncClient(proxy=_pcx_proxy(), timeout=30.0)
+    MCP_URL = os.environ.get("SUPERSTORE_MCP_URL", DEFAULT_MCP_URL)
+    MCP_TIMEOUT_S = 90.0
 
     def _hash_ip(ip: str) -> str:
         """One-way hash so we can count unique users without storing raw IPs."""
@@ -275,6 +225,33 @@ def create_web_app():
             usage_stats[key] = usage_stats.get(key, 0) + amount
         except Exception:
             pass  # Never let stats tracking break the app
+
+    def _tool_payload(res) -> dict:
+        """Extract a tool's dict payload across fastmcp client versions."""
+        data = getattr(res, "data", None)
+        if isinstance(data, dict):
+            return data
+        structured = getattr(res, "structured_content", None)
+        if isinstance(structured, dict):
+            return structured.get("result", structured)
+        blocks = res if isinstance(res, list) else getattr(res, "content", None) or []
+        for block in blocks:
+            text = getattr(block, "text", None)
+            if text:
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return {"text": text}
+        return {}
+
+    async def call_mcp(tool: str, args: dict) -> dict:
+        async with Client(MCP_URL, timeout=MCP_TIMEOUT_S) as client:
+            result = await client.call_tool(tool, args)
+        return _tool_payload(result)
+
+    def _mcp_error(tool: str, exc: Exception) -> JSONResponse:
+        _log("mcp_error", tool=tool, error=str(exc)[:300])
+        return JSONResponse(status_code=502, content={"error": f"{tool} failed: {exc}"})
 
     class NoCacheMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -413,137 +390,22 @@ def create_web_app():
 
     @web_app.post("/api/find-stores")
     async def find_stores(request: Request):
-        import asyncio
-
         body = await request.json()
-        query = body.get("location") or body.get("postal_code") or ""
-        _log("find_stores", query=f'"{query}"')
+        location = body.get("location") or body.get("postal_code") or ""
+        _log("find_stores", query=f'"{location}"')
         _inc("store_lookups")
-
-        # Canadian postal code: A1A 1A1 (letter-digit-letter space? digit-letter-digit)
-        CA_POSTAL_RE = re.compile(r"^([A-Za-z]\d[A-Za-z])\s*(\d[A-Za-z]\d)$")
-
-        def normalize_postal(raw: str) -> str | None:
-            """If *raw* looks like a Canadian postal code, return it as 'A1A 1A1' (uppercase, single space)."""
-            m = CA_POSTAL_RE.match(raw.strip())
-            if not m:
-                return None
-            return f"{m.group(1).upper()} {m.group(2).upper()}"
-
-        def normalize_address(addr: str) -> str:
-            """Shorten verbose directionals for better geocoding matches."""
-            replacements = {
-                r"\bNorthwest\b": "NW",
-                r"\bNortheast\b": "NE",
-                r"\bSouthwest\b": "SW",
-                r"\bSoutheast\b": "SE",
-            }
-            for pattern, abbr in replacements.items():
-                addr = re.sub(pattern, abbr, addr, flags=re.IGNORECASE)
-            return addr
-
-        async def geocode(q: str, client: httpx.AsyncClient):
-            mapbox_token = os.environ.get("MAPBOX_API_KEY", "")
-            url = (
-                f"https://api.mapbox.com/search/geocode/v6/forward"
-                f"?q={quote(q)}&country=ca&limit=1&access_token={mapbox_token}"
-            )
-            print(f'[find-stores] Mapbox geocode request: "{q}"')
-            resp = await client.get(url)
-            print(f"[find-stores] Mapbox HTTP {resp.status_code}, body length={len(resp.text)}")
-            if resp.status_code != 200:
-                print(f"[find-stores] Mapbox error response: {resp.text[:500]}")
-                return None
-            data = resp.json()
-            features = data.get("features", [])
-            if not features:
-                print(f'[find-stores] Mapbox returned no features for "{q}"')
-                return None
-            feat = features[0]
-            coords = feat["geometry"]["coordinates"]  # [lon, lat]
-            display = feat.get("properties", {}).get("full_address") or feat.get("properties", {}).get("name", "")
-            hit = {"lat": str(coords[1]), "lon": str(coords[0]), "display_name": display}
-            print(f'[find-stores] Geocoded "{q}" -> {hit["lat"]}, {hit["lon"]} ({hit["display_name"]})')
-            return hit
-
-        async def fetch_banner_locations(banner: str, client: httpx.AsyncClient):
-            try:
-                resp = await client.get(
-                    f"{PCX_BASE}/pickup-locations?bannerIds={banner}",
-                    headers=pcx_headers(banner),
-                )
-                if resp.status_code != 200 or not resp.text.strip():
-                    print(
-                        f"[find-stores] {banner}: HTTP {resp.status_code}, empty={not resp.text.strip()}, body={resp.text[:200]}"
-                    )
-                    return []
-                data = resp.json()
-                locs = data if isinstance(data, list) else data.get("pickupLocations", [])
-                print(f"[find-stores] {banner}: {len(locs)} locations")
-                return locs
-            except Exception as e:
-                print(f"[find-stores] {banner}: error fetching locations: {e}")
-                return []
-
-        async with _client() as client:
-            # Normalize Canadian postal codes (e.g. "t2k 0a5" -> "T2K 0A5")
-            postal = normalize_postal(query)
-            if postal and postal != query:
-                print(f'[find-stores] Normalized postal code: "{query}" -> "{postal}"')
-                query = postal
-
-            geo_hit = await geocode(query, client)
-            if not geo_hit:
-                normalized = normalize_address(query)
-                if normalized != query:
-                    print(f'[find-stores] Retrying with normalized address: "{normalized}"')
-                    geo_hit = await geocode(normalized, client)
-            if not geo_hit:
-                print(f'[find-stores] FAILED to geocode "{query}"')
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": f'Could not find location: "{query}"'},
-                )
-            lat = float(geo_hit["lat"])
-            lng = float(geo_hit["lon"])
-
-            # Query all banners in parallel
-            banner_tasks = {banner: fetch_banner_locations(banner, client) for banner in BANNERS}
-            results = await asyncio.gather(*banner_tasks.values())
-            all_locations = []
-            for locs in results:
-                all_locations.extend(locs)
-            print(f"[find-stores] Total locations across all banners: {len(all_locations)}")
-
-        def distance(loc):
-            gp = loc.get("geoPoint", {})
-            d_lat = (gp.get("latitude", 0) - lat) * math.pi / 180
-            d_lng = (gp.get("longitude", 0) - lng) * math.pi / 180
-            a = (
-                math.sin(d_lat / 2) ** 2
-                + math.cos(lat * math.pi / 180)
-                * math.cos(gp.get("latitude", 0) * math.pi / 180)
-                * math.sin(d_lng / 2) ** 2
-            )
-            return 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-        sorted_locs = sorted(all_locations, key=distance)
-        top3 = [
-            {
-                "storeId": loc.get("storeId"),
-                "name": loc.get("name"),
-                "banner": loc.get("storeBannerId", "superstore"),
-                "bannerName": loc.get("storeBannerName", ""),
-                "address": (loc.get("address") or {}).get("formattedAddress", ""),
-                "distance_km": round(distance(loc) * 10) / 10,
-            }
-            for loc in sorted_locs[:3]
-        ]
-        for s in top3:
+        try:
+            result = await call_mcp("superstore_find_nearest_stores", {"location": location})
+        except Exception as exc:
+            return _mcp_error("find_nearest_stores", exc)
+        if result.get("error"):
+            return JSONResponse(status_code=400, content={"error": result["error"]})
+        for s in result.get("stores", []):
             print(
-                f"[find-stores]   #{s['storeId']} [{s['banner']}] {s['name']} — {s['distance_km']}km — {s['address']}"
+                f"[find-stores]   #{s.get('storeId')} [{s.get('banner')}] {s.get('name')}"
+                f" — {s.get('distance_km')}km — {s.get('address')}"
             )
-        return {"stores": top3}
+        return result
 
     @web_app.post("/api/create-cart")
     async def create_cart(request: Request):
@@ -551,19 +413,18 @@ def create_web_app():
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
         _log("create_cart", store_id=store_id, banner=banner)
-        async with _client() as client:
-            resp = await client.post(
-                f"{PCX_BASE}/carts",
-                headers=pcx_headers(banner),
-                json={"bannerId": banner, "language": "en", "storeId": store_id},
+        try:
+            result = await call_mcp(
+                "superstore_create_cart", {"store_id": store_id, "banner": banner}
             )
-        data = resp.json()
-        cart_id = data.get("cartId") or data.get("id")
-        cart_url = BANNERS.get(banner, BANNERS["superstore"])["cart_url"]
-        _log("create_cart_done", cart_id=cart_id, status=resp.status_code)
-        if resp.status_code != 200:
-            print(f"[create-cart] Error response: {json.dumps(data, indent=2)}")
-        return {"cart_id": cart_id, "store_id": store_id, "banner": banner, "cart_url": cart_url}
+        except Exception as exc:
+            return _mcp_error("create_cart", exc)
+        # The MCP tool returns cart_url with ?forceCartId baked in; the frontend
+        # appends forceCartId itself, so hand it the base review URL.
+        if result.get("cart_url"):
+            result["cart_url"] = result["cart_url"].split("?")[0]
+        _log("create_cart_done", cart_id=result.get("cart_id"))
+        return result
 
     @web_app.post("/api/search-products")
     async def search_products(request: Request):
@@ -573,81 +434,21 @@ def create_web_app():
         banner = body.get("banner", "superstore")
         _log("search", term=f'"{term}"', store_id=store_id, banner=banner)
         _inc("searches")
-        async with _client() as client:
-            resp = await client.post(
-                f"{PCX_BASE}/products/search",
-                headers=pcx_headers(banner),
-                json={
-                    "term": term,
+        try:
+            result = await call_mcp(
+                "superstore_search_products",
+                {
+                    "store_id": store_id,
                     "banner": banner,
-                    "storeId": store_id,
-                    "lang": "en",
-                    "cartId": body.get("cart_id"),
-                    "pagination": {"from": 0, "size": 10},
+                    "term": term,
+                    "cart_id": body.get("cart_id") or "",
                 },
             )
-        data = resp.json()
-        total_results = data.get("pagination", {}).get("totalResults", "?")
-        all_results = data.get("results", [])
-        print(f"[search] HTTP {resp.status_code}, {total_results} total results, {len(all_results)} returned")
-        if resp.status_code != 200:
-            print(f"[search] Error response: {json.dumps(data, indent=2)}")
-        results = []
-        for p in all_results:
-            shoppable = p.get("shoppable", True)
-            stock = p.get("stockStatus", "OK")
-            if not shoppable or stock != "OK":
-                print(f"[search]   SKIP {p.get('code')} {p.get('name')!r} (shoppable={shoppable}, stock={stock})")
-                continue
-            prices = p.get("prices", {})
-            price_obj = prices.get("price", {}) or {}
-            product_price = price_obj.get("value") or p.get("price")
-            comp_prices = prices.get("comparisonPrices", [])
-            pu = p.get("pricingUnits") or {}
-
-            is_weighted = pu.get("type") == "SOLD_BY_WEIGHT" or pu.get("weighted") is True
-
-            item: dict = {
-                "code": p.get("code"),
-                "name": p.get("name"),
-                "brand": p.get("brand"),
-            }
-            if is_weighted:
-                kg_comp = next(
-                    (c for c in comp_prices if (c.get("unit") or "").lower() == "kg"),
-                    None,
-                )
-                pu_unit = (pu.get("unit") or "g").lower()
-                to_kg = (lambda x: x / 1000) if pu_unit == "g" else (lambda x: float(x))
-                step_kg = round(to_kg(pu.get("interval") or 100), 3)
-                min_kg = round(to_kg(pu.get("minOrderQuantity") or 100), 3)
-                max_q = pu.get("maxOrderQuantity")
-                max_kg = round(to_kg(max_q), 3) if max_q else None
-                item.update({
-                    "sold_by": "weight",
-                    "price_per_kg": kg_comp.get("value") if kg_comp else None,
-                    "step_kg": step_kg,
-                    "min_kg": min_kg,
-                    "max_kg": max_kg,
-                })
-                print(
-                    f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} sold_by=weight ${item['price_per_kg']}/kg"
-                )
-            else:
-                max_count = pu.get("maxOrderQuantity")
-                item.update({
-                    "sold_by": "each",
-                    "price": product_price,
-                    "package_size": p.get("packageSize") or None,
-                    "max_count": int(max_count) if max_count else None,
-                })
-                print(
-                    f"[search]   {item['code']} {item['brand'] or ''} {item['name']!r} sold_by=each ${product_price}"
-                )
-            results.append(item)
-        return {"products": results}
-
-    WEIGHT_INCREMENT_G = 100
+        except Exception as exc:
+            return _mcp_error("search_products", exc)
+        products = result.get("products", [])
+        print(f"[search] {len(products)} shoppable products for {term!r}")
+        return result
 
     @web_app.post("/api/add-to-cart")
     async def add_to_cart(request: Request):
@@ -655,93 +456,44 @@ def create_web_app():
         cart_id = body.get("cart_id")
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
-        items = body.get("items", [])
-
+        # Normalize into the MCP tool's discriminated-union item shapes so a
+        # missing count/kg from the model degrades gracefully instead of
+        # failing schema validation.
+        items = []
+        for it in body.get("items", []):
+            if it.get("sold_by") == "weight":
+                items.append(
+                    {
+                        "product_code": it.get("product_code"),
+                        "sold_by": "weight",
+                        "kg": float(it.get("kg") or 0.1),
+                    }
+                )
+            else:
+                items.append(
+                    {
+                        "product_code": it.get("product_code"),
+                        "sold_by": "each",
+                        "count": int(it.get("count") or it.get("quantity") or 1),
+                    }
+                )
         _log("add_to_cart", items=len(items), cart_id=cart_id, store_id=store_id, banner=banner)
         _inc("items_added", len(items))
-
-        entries = {}
-        item_sold_by = {}
-        for item in items:
-            code = item["product_code"]
-            sold_by = item.get("sold_by", "each")
-            item_sold_by[code] = sold_by
-            if sold_by == "weight":
-                kg = float(item.get("kg", 0))
-                grams = round(kg * 1000 / WEIGHT_INCREMENT_G) * WEIGHT_INCREMENT_G
-                grams = max(WEIGHT_INCREMENT_G, grams)
-                entries[code] = {
-                    "quantity": grams,
-                    "fulfillmentMethod": "pickup",
-                    "sellerId": store_id,
-                }
-                print(f"[add-to-cart]   {code} sold_by=weight kg={kg} -> {grams}g")
-            else:
-                count = int(item.get("count", item.get("quantity", 1)))
-                entries[code] = {
-                    "quantity": count,
-                    "fulfillmentMethod": "pickup",
-                    "sellerId": store_id,
-                }
-                print(f"[add-to-cart]   {code} sold_by=each count={count}")
-
-        async with _client() as client:
-            resp = await client.post(
-                f"{PCX_BASE}/carts/{cart_id}",
-                headers=pcx_headers(banner),
-                json={"entries": entries},
+        try:
+            result = await call_mcp(
+                "superstore_add_to_cart",
+                {"cart_id": cart_id, "store_id": store_id, "banner": banner, "items": items},
             )
-        data = resp.json()
-        print(f"[add-to-cart] HTTP {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[add-to-cart] Error response: {json.dumps(data, indent=2)}")
-
-        requested_codes = set(entries.keys())
-        added_codes = set()
-        added_items = []
-        cart_obj = data.get("cart", data)
-        for order in cart_obj.get("orders", []):
-            for entry in order.get("entries", []):
-                offer = entry.get("offer", {})
-                product = offer.get("product", {})
-                code = product.get("code") or offer.get("id", "")
-                if code not in requested_codes:
-                    continue
-                added_codes.add(code)
-                raw_qty = entry.get("quantity", 0)
-                if offer.get("sellingType") == "SOLD_BY_WEIGHT" or item_sold_by.get(code) == "weight":
-                    selling_unit = (offer.get("sellingUnit") or "").upper()
-                    kg = raw_qty if selling_unit == "KG" else raw_qty / 1000
-                    natural = {"kg": round(kg, 3)}
-                else:
-                    natural = {"count": int(raw_qty)}
-                added_items.append(
-                    {"product_code": code, "name": product.get("name", ""), **natural}
-                )
-                print(f"[add-to-cart]   OK {code} {product.get('name', '')!r} {natural}")
-
-        failed_items = []
-        for err in data.get("errors", []):
-            reason = err.get("message", "Unknown error")
-            pc = err.get("productCode", "")
-            if "exceeds maximum" in reason.lower():
-                reason += " Check max_kg or max_count from search results and reduce quantity."
-            failed_items.append({"product_code": pc, "reason": reason})
-            print(f"[add-to-cart]   FAIL {pc}: {reason}")
-        failed_codes = {f["product_code"] for f in failed_items}
-        for code in requested_codes:
-            if code not in added_codes and code not in failed_codes:
-                reason = "Item not found in cart after adding — may be unavailable"
-                failed_items.append({"product_code": code, "reason": reason})
-                print(f"[add-to-cart]   MISSING {code}: {reason}")
-
-        success = len(added_items) > 0
-        print(f"[add-to-cart] Result: {len(added_items)} added, {len(failed_items)} failed")
-        return {
-            "success": success,
-            "added_items": added_items,
-            "failed_items": failed_items,
-        }
+        except Exception as exc:
+            return _mcp_error("add_to_cart", exc)
+        result.setdefault("added_items", [])
+        result.setdefault("failed_items", [])
+        result["success"] = len(result["added_items"]) > 0
+        print(
+            f"[add-to-cart] {len(result['added_items'])} added, "
+            f"{len(result['failed_items'])} failed"
+        )
+        return result
 
     @web_app.post("/api/remove-from-cart")
     async def remove_from_cart(request: Request):
@@ -749,79 +501,52 @@ def create_web_app():
         cart_id = body.get("cart_id")
         store_id = body.get("store_id")
         banner = body.get("banner", "superstore")
-        items = body.get("items", [])
-
-        _log("remove_from_cart", items=len(items), cart_id=cart_id, banner=banner)
-        for item in items:
-            print(f"[remove-from-cart]   {item['product_code']}")
-
-        # Setting quantity to 0 removes the item (SAP Hybris CartService behavior)
-        entries = {}
-        for item in items:
-            entries[item["product_code"]] = {
-                "quantity": 0,
-                "fulfillmentMethod": "pickup",
-                "sellerId": store_id,
-            }
-
-        async with _client() as client:
-            resp = await client.post(
-                f"{PCX_BASE}/carts/{cart_id}",
-                headers=pcx_headers(banner),
-                json={"entries": entries},
+        codes = body.get("product_codes") or [
+            it.get("product_code") for it in body.get("items", [])
+        ]
+        _log("remove_from_cart", items=len(codes), cart_id=cart_id, banner=banner)
+        try:
+            result = await call_mcp(
+                "superstore_remove_from_cart",
+                {
+                    "cart_id": cart_id,
+                    "store_id": store_id,
+                    "banner": banner,
+                    "product_codes": codes,
+                },
             )
-        data = resp.json()
-        print(f"[remove-from-cart] HTTP {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[remove-from-cart] Error response: {json.dumps(data, indent=2)}")
-
-        # Check which items are still in the cart after removal
-        remaining_codes = set()
-        cart_obj = data.get("cart", data)
-        for order in cart_obj.get("orders", []):
-            for entry in order.get("entries", []):
-                product = entry.get("offer", {}).get("product", {})
-                code = product.get("code") or product.get("id", "")
-                remaining_codes.add(code)
-
-        requested_codes = {item["product_code"] for item in items}
-        removed_items = []
-        failed_items = []
-        for item in items:
-            code = item["product_code"]
-            if code not in remaining_codes:
-                removed_items.append({"product_code": code})
-                print(f"[remove-from-cart]   OK removed {code}")
-            else:
-                failed_items.append({"product_code": code, "reason": "Item still in cart after removal attempt"})
-                print(f"[remove-from-cart]   FAIL {code}: still in cart")
-
-        # Also include any API-level errors
-        for err in data.get("errors", []):
-            reason = err.get("message", "Unknown error")
-            pc = err.get("productCode", "")
-            if pc and pc not in {f["product_code"] for f in failed_items}:
-                failed_items.append({"product_code": pc, "reason": reason})
-                print(f"[remove-from-cart]   FAIL {pc}: {reason}")
-
-        success = len(removed_items) > 0
-        print(f"[remove-from-cart] Result: {len(removed_items)} removed, {len(failed_items)} failed")
-        return {
-            "success": success,
-            "removed_items": removed_items,
-            "failed_items": failed_items,
-        }
+        except Exception as exc:
+            return _mcp_error("remove_from_cart", exc)
+        result.setdefault("removed_items", [])
+        result.setdefault("failed_items", [])
+        result["success"] = len(result["removed_items"]) > 0
+        print(
+            f"[remove-from-cart] {len(result['removed_items'])} removed, "
+            f"{len(result['failed_items'])} failed"
+        )
+        return result
 
     @web_app.post("/api/finish-shopping")
     async def finish_shopping(request: Request):
         body = await request.json()
         cart_id = body.get("cart_id")
         banner = body.get("banner", "superstore")
-        base_url = BANNERS.get(banner, BANNERS["superstore"])["cart_url"]
-        cart_url = f"{base_url}?forceCartId={cart_id}" if cart_id else None
         _log("finish_shopping", cart_id=cart_id, banner=banner)
         _inc("completed_sessions")
-        return {"success": True, "message": "Shopping session complete", "cart_url": cart_url}
+        if not cart_id:
+            # e.g. off_topic exit before a store was ever picked
+            return {"success": True, "message": "Shopping session complete", "cart_url": None}
+        try:
+            result = await call_mcp(
+                "superstore_finish_shopping", {"cart_id": cart_id, "banner": banner}
+            )
+        except Exception as exc:
+            return _mcp_error("finish_shopping", exc)
+        return {
+            "success": True,
+            "message": "Shopping session complete",
+            "cart_url": result.get("cart_url"),
+        }
 
     @web_app.get("/")
     async def index():
@@ -847,9 +572,7 @@ def create_web_app():
     image=image,
     secrets=[
         modal.Secret.from_name("pc-express-voice-openai"),
-        modal.Secret.from_name("mapbox-api-key"),
         modal.Secret.from_name("pc-express-voice-app-token"),
-        modal.Secret.from_name("oxy-proxy"),
     ],
     timeout=3600,
     cpu=0.25,
